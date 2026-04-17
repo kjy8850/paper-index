@@ -1,0 +1,59 @@
+# =====================================================================
+# DS918+ (Synology NAS) 전용 compose
+# Container Manager → Project → Upload 에서 이 파일을 올리세요.
+#
+# - pgvector/pg16 이미지
+# - 볼륨은 NAS 의 공유폴더(/volume1/docker/papers-pg/data)에 고정
+# - 포트는 내부 서브넷에만 노출 (host 바인딩 IP 를 NAS 의 LAN IP 로 설정)
+#   외부 노출 절대 금지.
+# =====================================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: paper-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${PGUSER:-paperuser}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?환경변수_PGPASSWORD_를_.env.nas_에_설정하세요}
+      POSTGRES_DB:       ${PGDATABASE:-papers}
+      # 초기 접속 튜닝
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # ⚠️ NAS 의 LAN IP 로 바인딩: 외부 노출 차단
+    #   예) NAS IP 가 192.168.1.50 이면 아래 두 줄을 "192.168.1.50:5432:5432" 로 바꾸세요.
+    #   혹은 ${PG_BIND_IP:-127.0.0.1} 환경변수로 제어.
+    ports:
+      - "${PG_BIND_IP:-127.0.0.1}:${PGPORT:-5432}:5432"
+    volumes:
+      # Synology 공유폴더 매핑. Container Manager Project 편집기에서
+      # 이 경로 그대로 쓰거나 /volume1 -> /volumeUSB 등 실제 볼륨에 맞게 수정.
+      - /volume1/docker/papers-pg/data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    # 메모리 튜닝 (DS918+ 8GB 기준. 4GB 면 shared_buffers=256MB 정도로 내리세요)
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - max_connections=50
+      # pgvector HNSW 빌드 병렬화
+      - -c
+      - max_parallel_maintenance_workers=2
+      - -c
+      - max_parallel_workers_per_gather=2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-paperuser} -d ${PGDATABASE:-papers}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

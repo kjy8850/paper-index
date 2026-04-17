@@ -1,0 +1,156 @@
+{
+  "name": "Paper Daily Collect & Ingest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "cron",
+      "name": "매일 06:00 트리거",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// keywords.json 과 동기화된 우선순위 키워드. 간단히 여기서 하드코딩하거나\n// HTTP GET 으로 우리 /config 엔드포인트에서 가져오도록 바꿀 수 있습니다.\nconst queries = [\n  { q: 'photoresist resin polymer',       weight: 10, hint: 'resin' },\n  { q: 'EUV photoresist',                 weight: 10, hint: 'pr' },\n  { q: 'chemically amplified resist',     weight: 9,  hint: 'pr' },\n  { q: 'metal oxide photoresist',         weight: 8,  hint: 'pr' },\n  { q: 'photoresist development TMAH',    weight: 7,  hint: 'develop_etch' },\n  { q: 'EUV lithography resist outgassing', weight: 7, hint: 'pr' },\n  { q: 'line edge roughness photoresist', weight: 6,  hint: 'pr' },\n  { q: 'photo acid generator PAG',        weight: 6,  hint: 'pr' },\n  { q: 'dry etching selectivity semiconductor', weight: 5, hint: 'develop_etch' },\n  { q: 'negative tone development',       weight: 5,  hint: 'develop_etch' },\n  { q: 'molecular glass resist',          weight: 5,  hint: 'resin' },\n  { q: 'novel photoresist',               weight: 3,  hint: 'novel_idea' }\n];\nreturn queries.map(item => ({ json: item }));"
+      },
+      "id": "keywords",
+      "name": "키워드 세트",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 320]
+    },
+    {
+      "parameters": {
+        "url": "=http://export.arxiv.org/api/query?search_query=all:%22{{$json.q}}%22&start=0&max_results=40&sortBy=submittedDate&sortOrder=descending",
+        "options": {
+          "response": { "response": { "responseFormat": "text" } },
+          "timeout": 20000
+        }
+      },
+      "id": "arxiv",
+      "name": "arXiv 검색",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 220]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.semanticscholar.org/graph/v1/paper/search?query={{encodeURIComponent($json.q)}}&limit=40&fields=title,abstract,authors,year,publicationDate,venue,externalIds,url,openAccessPdf,citationCount",
+        "options": { "timeout": 20000 }
+      },
+      "id": "ss",
+      "name": "Semantic Scholar 검색",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 340]
+    },
+    {
+      "parameters": {
+        "url": "=https://chemrxiv.org/engage/chemrxiv/public-api/v1/items?term={{encodeURIComponent($json.q)}}&limit=30&sort=PUBLISHED_DATE_DESC",
+        "options": { "timeout": 20000 }
+      },
+      "id": "chemrxiv",
+      "name": "ChemRxiv 검색",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 460]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 세 소스의 응답을 동일 PaperRef 형식으로 정규화 + 머지 + 중복 제거.\n// 각 소스 노드에서 넘어온 배치를 모두 모아서 처리.\nconst items = $input.all();\nconst out = [];\n\nfunction push(ref) {\n  if (!ref || !ref.title) return;\n  out.push(ref);\n}\n\nfor (const it of items) {\n  const src = it.json?.__srcName || '';   // 보조용 (세팅 안 돼도 동작)\n  const data = it.json;\n  // --- arXiv (XML 텍스트) ---\n  if (typeof data === 'string' && data.includes('<feed')) {\n    const xml = data;\n    const entryRe = /<entry>[\\s\\S]*?<\\/entry>/g;\n    const matches = xml.match(entryRe) ?? [];\n    for (const e of matches) {\n      const idM   = /<id>([^<]+)<\\/id>/.exec(e);\n      const ttlM  = /<title>([\\s\\S]*?)<\\/title>/.exec(e);\n      const sumM  = /<summary>([\\s\\S]*?)<\\/summary>/.exec(e);\n      const pubM  = /<published>([^<]+)<\\/published>/.exec(e);\n      const pdfM  = /<link[^>]*title=\"pdf\"[^>]*href=\"([^\"]+)\"/.exec(e);\n      const htmlM = /<link[^>]*rel=\"alternate\"[^>]*href=\"([^\"]+)\"/.exec(e);\n      const doiM  = /<arxiv:doi[^>]*>([^<]+)<\\/arxiv:doi>/.exec(e);\n      const authors = [...e.matchAll(/<name>([^<]+)<\\/name>/g)].map(m => m[1]);\n      const arxivIdM = idM ? /arxiv\\.org\\/abs\\/([^\\s\"]+?)(v\\d+)?$/.exec(idM[1]) : null;\n      push({\n        source: 'arxiv',\n        source_id: arxivIdM ? arxivIdM[1] : (idM ? idM[1] : ''),\n        arxiv_id: arxivIdM ? arxivIdM[1] : undefined,\n        doi: doiM ? doiM[1] : undefined,\n        title: (ttlM ? ttlM[1] : '').replace(/\\s+/g, ' ').trim(),\n        abstract: (sumM ? sumM[1] : '').trim(),\n        authors,\n        published_at: pubM ? pubM[1].slice(0,10) : undefined,\n        venue: 'arXiv',\n        url: htmlM ? htmlM[1] : (idM ? idM[1] : undefined),\n        pdf_url: pdfM ? pdfM[1] : undefined,\n        citations: 0\n      });\n    }\n    continue;\n  }\n  // --- Semantic Scholar ---\n  if (data && Array.isArray(data.data)) {\n    for (const p of data.data) {\n      push({\n        source: 'semantic_scholar',\n        source_id: p.paperId,\n        doi: p.externalIds?.DOI?.toLowerCase(),\n        arxiv_id: p.externalIds?.ArXiv,\n        title: (p.title || '').trim(),\n        abstract: (p.abstract || '').trim(),\n        authors: (p.authors || []).map(a => a?.name).filter(Boolean),\n        published_at: p.publicationDate || (p.year ? `${p.year}-01-01` : undefined),\n        venue: p.venue,\n        url: p.url,\n        pdf_url: p.openAccessPdf?.url,\n        citations: p.citationCount ?? 0\n      });\n    }\n    continue;\n  }\n  // --- ChemRxiv ---\n  if (data && (data.itemHits || data.items)) {\n    const items = data.itemHits ?? data.items;\n    for (const hit of items) {\n      const item = hit.item || hit;\n      if (!item?.id) continue;\n      const authors = (item.authors || []).map(a => [a.firstName, a.lastName].filter(Boolean).join(' '));\n      push({\n        source: 'chemrxiv',\n        source_id: String(item.id),\n        doi: item.doi ? String(item.doi).toLowerCase() : undefined,\n        title: (item.title || '').trim(),\n        abstract: (item.abstract || '').trim(),\n        authors,\n        published_at: item.publishedDate ? item.publishedDate.slice(0,10) : undefined,\n        venue: 'ChemRxiv',\n        url: `https://chemrxiv.org/engage/chemrxiv/article-details/${item.id}`,\n        pdf_url: item.asset?.original?.url,\n        citations: 0\n      });\n    }\n  }\n}\n\n// 중복 제거\nconst seen = new Set();\nconst uniq = [];\nfor (const p of out) {\n  const key = p.doi ? `doi:${p.doi}` : (p.arxiv_id ? `arxiv:${p.arxiv_id}` : `${p.source}:${p.source_id}`);\n  if (seen.has(key)) continue;\n  seen.add(key);\n  uniq.push(p);\n}\n\n// 최대 300 건으로 제한 (일일 목표)\nreturn uniq.slice(0, 300).map(json => ({ json }));"
+      },
+      "id": "merge",
+      "name": "정규화 & 중복 제거",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 340]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "split",
+      "name": "Split in Batches (10)",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1200, 340]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://localhost:8787/ingest/batch",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{$env.INGEST_API_KEY}}" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ papers: $input.all().map(i => i.json) }) }}",
+        "options": { "timeout": 180000 }
+      },
+      "id": "ingest",
+      "name": "Ingest API 호출",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 340]
+    },
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      },
+      "id": "wait",
+      "name": "배치 간 대기 5초",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1680, 340]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 실행 요약\nconst items = $input.all();\nconst summary = items.reduce((acc, it) => {\n  const r = it.json || {};\n  acc.batches += 1;\n  acc.ingested += r.ingested ?? 0;\n  acc.failed   += r.failed ?? 0;\n  return acc;\n}, { batches: 0, ingested: 0, failed: 0 });\nreturn [{ json: summary }];"
+      },
+      "id": "summary",
+      "name": "요약",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 340]
+    }
+  ],
+  "connections": {
+    "매일 06:00 트리거": {
+      "main": [[{ "node": "키워드 세트", "type": "main", "index": 0 }]]
+    },
+    "키워드 세트": {
+      "main": [[
+        { "node": "arXiv 검색",             "type": "main", "index": 0 },
+        { "node": "Semantic Scholar 검색",  "type": "main", "index": 0 },
+        { "node": "ChemRxiv 검색",          "type": "main", "index": 0 }
+      ]]
+    },
+    "arXiv 검색":            { "main": [[{ "node": "정규화 & 중복 제거", "type": "main", "index": 0 }]] },
+    "Semantic Scholar 검색": { "main": [[{ "node": "정규화 & 중복 제거", "type": "main", "index": 0 }]] },
+    "ChemRxiv 검색":         { "main": [[{ "node": "정규화 & 중복 제거", "type": "main", "index": 0 }]] },
+    "정규화 & 중복 제거":    { "main": [[{ "node": "Split in Batches (10)", "type": "main", "index": 0 }]] },
+    "Split in Batches (10)": { "main": [[{ "node": "Ingest API 호출", "type": "main", "index": 0 }]] },
+    "Ingest API 호출":       { "main": [[{ "node": "배치 간 대기 5초", "type": "main", "index": 0 }]] },
+    "배치 간 대기 5초":      { "main": [[{ "node": "Split in Batches (10)", "type": "main", "index": 0 }, { "node": "요약", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "versionId": "1",
+  "tags": ["paper-index"]
+}

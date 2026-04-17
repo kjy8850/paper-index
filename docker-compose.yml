@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: paper-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PGUSER:-paperuser}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-paperpass}
+      POSTGRES_DB: ${PGDATABASE:-papers}
+    ports:
+      - "${PGPORT:-5433}:5432"
+    volumes:
+      - paper_pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-paperuser} -d ${PGDATABASE:-papers}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  paper_pgdata:

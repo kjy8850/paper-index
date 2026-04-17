@@ -1,0 +1,129 @@
+# =====================================================================
+# 미니PC (N150) 전용 compose
+# 이 머신은 "머리" 역할: n8n 스케줄러 + ingest API + 선택적 MCP HTTP
+# PostgreSQL 은 NAS 에 있는 것을 원격으로 바라봅니다.
+#
+# 실행:
+#   1) .env.minipc 를 .env 로 복사 후 값 채우기
+#      (중요: PGHOST=<NAS LAN IP>, GEMINI_API_KEY=...)
+#   2) docker compose -f docker-compose.minipc.yml up -d
+# =====================================================================
+
+services:
+
+  # -------------------------------------------------------------------
+  # n8n : 스케줄링/자동화 오케스트레이터
+  # 웹 UI  http://<미니PC IP>:5678
+  # -------------------------------------------------------------------
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: paper-n8n
+    restart: unless-stopped
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      GENERIC_TIMEZONE: ${TZ:-Asia/Seoul}
+      TZ: ${TZ:-Asia/Seoul}
+      # 기본 Basic Auth (원하면 끄기 가능)
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:?.env.minipc_에_N8N_USER_를_설정하세요}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:?.env.minipc_에_N8N_PASSWORD_를_설정하세요}
+      # ingest 컨테이너를 참조할 때 쓰도록 주입
+      INGEST_BASE_URL: "http://ingest:8787"
+      INGEST_API_KEY: ${INGEST_API_KEY}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - ingest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # -------------------------------------------------------------------
+  # ingest : 수집/분석/저장 Express API + (선택) MCP HTTP
+  # -------------------------------------------------------------------
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paper-ingest
+    restart: unless-stopped
+    ports:
+      - "${INGEST_PORT:-8787}:8787"
+    environment:
+      # --- NAS Postgres 원격 접속 ---
+      PGHOST:     ${PGHOST:?NAS_LAN_IP_를_PGHOST_에_설정}
+      PGPORT:     ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-papers}
+      PGUSER:     ${PGUSER:-paperuser}
+      PGPASSWORD: ${PGPASSWORD:?PGPASSWORD_설정_필요}
+      PG_POOL_MAX: ${PG_POOL_MAX:-10}
+
+      # --- Gemini ---
+      GEMINI_API_KEY:         ${GEMINI_API_KEY:?GEMINI_API_KEY_설정_필요}
+      GEMINI_GEN_MODEL:       ${GEMINI_GEN_MODEL:-gemini-2.5-flash}
+      GEMINI_EMBED_MODEL:     ${GEMINI_EMBED_MODEL:-text-embedding-004}
+      GEMINI_CONCURRENCY:     ${GEMINI_CONCURRENCY:-3}
+      GEMINI_MIN_INTERVAL_MS: ${GEMINI_MIN_INTERVAL_MS:-400}
+
+      # --- 수집 파라미터 ---
+      DAILY_TARGET:    ${DAILY_TARGET:-300}
+      MAX_PER_SOURCE:  ${MAX_PER_SOURCE:-50}
+      INGEST_API_KEY:  ${INGEST_API_KEY:?INGEST_API_KEY_설정_필요}
+
+      # --- Semantic Scholar 선택 ---
+      SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
+
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV:  production
+      TZ:        ${TZ:-Asia/Seoul}
+    # healthcheck (DB 가 아직 안 붙어도 서버는 뜨므로 /health 만 체크)
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # -------------------------------------------------------------------
+  # (선택) MCP over HTTP : Claude Web Custom Connector 용
+  # 필요 없으면 이 블록 통째로 삭제해도 됩니다.
+  # stdio MCP 는 Claude Desktop 이 직접 띄우는 구조라 여기선 다루지 않음.
+  # -------------------------------------------------------------------
+  mcp-http:
+    profiles: ["mcp-http"]     # 기본 비활성. 사용 시: `--profile mcp-http`
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paper-mcp-http
+    restart: unless-stopped
+    command: ["node", "src/mcp-http.js"]
+    ports:
+      - "${MCP_HTTP_PORT:-8788}:8788"
+    environment:
+      PGHOST:     ${PGHOST}
+      PGPORT:     ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-papers}
+      PGUSER:     ${PGUSER:-paperuser}
+      PGPASSWORD: ${PGPASSWORD}
+      GEMINI_API_KEY:     ${GEMINI_API_KEY}
+      GEMINI_GEN_MODEL:   ${GEMINI_GEN_MODEL:-gemini-2.5-flash}
+      GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-text-embedding-004}
+      MCP_HTTP_PORT:      ${MCP_HTTP_PORT:-8788}
+      MCP_HTTP_TOKEN:     ${MCP_HTTP_TOKEN:?Claude_Web_전용_공유토큰}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV:  production
+      TZ:        ${TZ:-Asia/Seoul}
+
+volumes:
+  n8n_data:

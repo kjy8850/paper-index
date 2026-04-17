@@ -1,0 +1,32 @@
+{
+  "_comment": "수집 쿼리에 사용할 키워드 세트. weight 가 높을수록 상위에서 더 많이 수집. 각 소스 API 에 맞게 쿼리로 변환됨.",
+  "version": 1,
+  "primary": [
+    { "q": "photoresist resin polymer", "weight": 10, "category_hint": "resin" },
+    { "q": "EUV photoresist",           "weight": 10, "category_hint": "pr" },
+    { "q": "chemically amplified resist","weight": 9,  "category_hint": "pr" },
+    { "q": "metal oxide photoresist",   "weight": 8,  "category_hint": "pr" },
+    { "q": "photoresist development TMAH","weight": 7, "category_hint": "develop_etch" },
+    { "q": "EUV lithography resist outgassing","weight": 7, "category_hint": "pr" },
+    { "q": "line edge roughness LER photoresist","weight": 6, "category_hint": "pr" },
+    { "q": "photo acid generator PAG",  "weight": 6, "category_hint": "pr" }
+  ],
+  "secondary": [
+    { "q": "dry etching selectivity semiconductor", "weight": 5, "category_hint": "develop_etch" },
+    { "q": "spin-on carbon hard mask",              "weight": 4, "category_hint": "misc_semi" },
+    { "q": "negative tone development",             "weight": 5, "category_hint": "develop_etch" },
+    { "q": "molecular glass resist",                "weight": 5, "category_hint": "resin" },
+    { "q": "directed self assembly DSA lithography","weight": 4, "category_hint": "litho" },
+    { "q": "nanoimprint lithography resist",        "weight": 3, "category_hint": "litho" }
+  ],
+  "fresh_probe": {
+    "_comment": "'독창적/신선한 아이디어' 포착용. 짧은 일반 쿼리로 최근 7일 내 논문 샘플링.",
+    "queries": [
+      "novel photoresist",
+      "new lithography material",
+      "breakthrough semiconductor material"
+    ],
+    "max_results_per_query": 20,
+    "days_window": 14
+  }
+}
