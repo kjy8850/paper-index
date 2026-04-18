@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS research_papers (
   -- 임베딩 (768 dim)
   embedding         vector(768),
 
+  -- PDF 풀텍스트 파이프라인
+  fulltext_md           TEXT,
+  fulltext_status       TEXT NOT NULL DEFAULT 'none',
+  fulltext_source       TEXT,
+  fulltext_processed_at TIMESTAMPTZ,
+  fulltext_attempts     SMALLINT NOT NULL DEFAULT 0,
+  fulltext_error        TEXT,
+  embedding_v           TEXT NOT NULL DEFAULT 'abs',
+
   -- 운영용
   raw_metadata      JSONB       NOT NULL DEFAULT '{}'::jsonb,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -145,7 +154,90 @@ CREATE TABLE IF NOT EXISTS search_log (
 CREATE INDEX IF NOT EXISTS idx_search_log_created ON search_log (created_at DESC);
 
 -- =====================================================================
--- 5) 편의 뷰: 최근 수집 현황
+-- 5) PDF 파이프라인 (Phase 2)
+-- =====================================================================
+CREATE INDEX IF NOT EXISTS idx_papers_fulltext_status
+  ON research_papers (fulltext_status)
+  WHERE fulltext_status IN ('pending', 'running', 'md_ready', 'batch_submitted', 'failed');
+
+CREATE TABLE IF NOT EXISTS api_usage (
+  id              BIGSERIAL PRIMARY KEY,
+  ts              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  provider        TEXT NOT NULL DEFAULT 'gemini',
+  model           TEXT NOT NULL,
+  endpoint        TEXT NOT NULL,
+  is_batch        BOOLEAN NOT NULL DEFAULT false,
+  input_tokens    INTEGER NOT NULL DEFAULT 0,
+  output_tokens   INTEGER NOT NULL DEFAULT 0,
+  cached_tokens   INTEGER NOT NULL DEFAULT 0,
+  cost_usd        NUMERIC(12,6) NOT NULL DEFAULT 0,
+  caller          TEXT,
+  paper_id        BIGINT,
+  batch_job_id    BIGINT,
+  meta            JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_usage_ts     ON api_usage (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_api_usage_caller ON api_usage (caller, ts DESC);
+
+CREATE OR REPLACE VIEW v_today_cost AS
+SELECT
+  COALESCE(SUM(cost_usd), 0)::NUMERIC(12,6) AS spent_usd,
+  COALESCE(SUM(input_tokens), 0)             AS input_tokens,
+  COALESCE(SUM(output_tokens), 0)            AS output_tokens,
+  COUNT(*)                                   AS calls
+FROM api_usage
+WHERE ts >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
+
+CREATE OR REPLACE VIEW v_daily_api_cost AS
+SELECT
+  date_trunc('day', ts)::date AS day,
+  caller,
+  model,
+  SUM(input_tokens)  AS input_tokens,
+  SUM(output_tokens) AS output_tokens,
+  SUM(cost_usd)      AS cost_usd,
+  COUNT(*)           AS calls
+FROM api_usage
+WHERE ts > now() - INTERVAL '30 days'
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, 5 DESC;
+
+CREATE TABLE IF NOT EXISTS cost_settings (
+  id                      SMALLINT PRIMARY KEY DEFAULT 1,
+  daily_limit_usd         NUMERIC(10,4) NOT NULL DEFAULT 1.00,
+  alert_threshold_ratio   NUMERIC(4,3)  NOT NULL DEFAULT 0.80,
+  hard_stop_enabled       BOOLEAN       NOT NULL DEFAULT true,
+  updated_at              TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  CONSTRAINT single_row CHECK (id = 1)
+);
+
+INSERT INTO cost_settings (id, daily_limit_usd)
+VALUES (1, 1.00)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS batch_jobs (
+  id              BIGSERIAL PRIMARY KEY,
+  job_name        TEXT UNIQUE NOT NULL,
+  input_file_id   TEXT NOT NULL,
+  output_file_id  TEXT,
+  state           TEXT NOT NULL,
+  paper_ids       BIGINT[] NOT NULL,
+  request_count   INTEGER NOT NULL,
+  success_count   INTEGER NOT NULL DEFAULT 0,
+  fail_count      INTEGER NOT NULL DEFAULT 0,
+  error_samples   JSONB NOT NULL DEFAULT '[]'::jsonb,
+  submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at    TIMESTAMPTZ,
+  applied_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_state
+  ON batch_jobs (state)
+  WHERE state IN ('PENDING', 'RUNNING');
+
+-- =====================================================================
+-- 6) 편의 뷰: 최근 수집 현황
 -- =====================================================================
 CREATE OR REPLACE VIEW v_daily_ingestion AS
 SELECT
