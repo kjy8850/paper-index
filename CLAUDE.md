@@ -85,4 +85,5 @@ Makefile            자주 쓰는 명령 모음
 - `README.md` — 개괄 + 단일머신 옵션
 - `docs/DEPLOY-HYBRID.md` — 상세 하이브리드 가이드 (여러 옵션)
 - `docs/RUNBOOK.md` — Ubuntu + NFS + 린 NAS 에 특화된 "처음 30분" 체크리스트
+- `docs/PDF-PIPELINE.md` — Docling + Gemini Batch API + 일일 $1 비용 가드 (Phase 1~8 실행 가이드)
 - `n8n/README.md` — 워크플로 임포트·수정법
