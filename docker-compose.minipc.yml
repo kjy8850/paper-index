@@ -140,5 +140,40 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # -------------------------------------------------------------------
+  # pdf-worker : pending 논문을 폴링해 docling-svc로 Markdown 변환 (Phase 4)
+  # -------------------------------------------------------------------
+  pdf-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paper-pdf-worker
+    command: ["node", "src/pdf-worker.js"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PGHOST:     ${PGHOST}
+      PGPORT:     ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-papers}
+      PGUSER:     ${PGUSER:-paperuser}
+      PGPASSWORD: ${PGPASSWORD}
+      DOCLING_URL:          ${DOCLING_URL:-http://localhost:8089}
+      PDF_WORKER_BATCH:     ${PDF_WORKER_BATCH:-5}
+      PDF_WORKER_POLL_MS:   ${PDF_WORKER_POLL_MS:-10000}
+      PDF_MAX_BYTES:        ${PDF_MAX_BYTES:-52428800}
+      PDF_FETCH_TIMEOUT_MS: ${PDF_FETCH_TIMEOUT_MS:-60000}
+      DOCLING_TIMEOUT_MS:   ${DOCLING_TIMEOUT_MS:-240000}
+      PDF_MIN_MD_BYTES:     ${PDF_MIN_MD_BYTES:-2048}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV:  production
+      TZ:        ${TZ:-Asia/Seoul}
+    depends_on:
+      - docling-svc
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
 volumes:
   n8n_data:
