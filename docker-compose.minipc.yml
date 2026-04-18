@@ -19,8 +19,7 @@ services:
     image: docker.n8n.io/n8nio/n8n:latest
     container_name: paper-n8n
     restart: unless-stopped
-    ports:
-      - "${N8N_PORT:-5678}:5678"
+    network_mode: host
     environment:
       N8N_HOST: ${N8N_HOST:-localhost}
       N8N_PORT: 5678
@@ -31,9 +30,10 @@ services:
       N8N_BASIC_AUTH_ACTIVE: "true"
       N8N_BASIC_AUTH_USER: ${N8N_USER:?.env.minipc_에_N8N_USER_를_설정하세요}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:?.env.minipc_에_N8N_PASSWORD_를_설정하세요}
-      # ingest 컨테이너를 참조할 때 쓰도록 주입
-      INGEST_BASE_URL: "http://ingest:8787"
+      # host network: ingest 는 localhost 로 참조
+      INGEST_BASE_URL: "http://localhost:8787"
       INGEST_API_KEY: ${INGEST_API_KEY}
+      N8N_SECURE_COOKIE: "false"
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
@@ -53,6 +53,7 @@ services:
       dockerfile: Dockerfile
     container_name: paper-ingest
     restart: unless-stopped
+    network_mode: host
     ports:
       - "${INGEST_PORT:-8787}:8787"
     environment:
@@ -124,6 +125,20 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       NODE_ENV:  production
       TZ:        ${TZ:-Asia/Seoul}
+
+  # -------------------------------------------------------------------
+  # docling-svc : PDF → Markdown 변환 (Phase 1)
+  # -------------------------------------------------------------------
+  docling-svc:
+    build: ./services/docling-svc
+    container_name: paper-docling
+    restart: unless-stopped
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   n8n_data:
