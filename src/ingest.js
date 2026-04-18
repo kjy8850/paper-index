@@ -67,6 +67,7 @@ async function upsertPaper(ref, analysis, embedding) {
     JSON.stringify(analysis.tags ?? []),
     vec,
     JSON.stringify({ source_raw: ref.source }),
+    /^https?:\/\/.+/.test(ref.pdf_url ?? '') ? 'pending' : 'no_pdf',
   ];
   // DOI 기준 우선 충돌, 없으면 arxiv_id, 없으면 source+source_id 로.
   const sql = `
@@ -76,9 +77,9 @@ async function upsertPaper(ref, analysis, embedding) {
        summary_ko, key_findings, materials, techniques,
        novelty_score, relevance_score,
        major_category, mid_category, sub_category, tags,
-       embedding, raw_metadata)
+       embedding, raw_metadata, fulltext_status)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::vector,$24::jsonb)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::vector,$24::jsonb,$25)
     ON CONFLICT (doi) DO UPDATE SET
       title           = EXCLUDED.title,
       abstract        = EXCLUDED.abstract,
