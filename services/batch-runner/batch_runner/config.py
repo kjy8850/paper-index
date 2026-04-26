@@ -34,23 +34,36 @@ else:
         "cached_input_ratio": 0.25,
     }
 
-_schema_path = Path(__file__).parent.parent.parent.parent / "config" / "paper-analysis-schema.json"
+# =====================================================================
+# Layer 2 — relevance + paper_type 만 묻는 가벼운 스키마.
+#   (옛 ANALYSIS_SCHEMA 는 deep parser(Layer 4) 가 책임지도록 분리됨)
+# =====================================================================
+_schema_path = Path(__file__).parent.parent.parent.parent / "config" / "paper-relevance-schema.json"
 if _schema_path.exists():
-    ANALYSIS_SCHEMA = json.loads(_schema_path.read_text())
+    RELEVANCE_SCHEMA = json.loads(_schema_path.read_text())
 else:
-    ANALYSIS_SCHEMA = {
+    RELEVANCE_SCHEMA = {
         "type": "OBJECT",
         "properties": {
-            "summary_ko":      {"type": "STRING",  "description": "한글 3-4줄 요약"},
-            "key_findings":    {"type": "ARRAY",   "items": {"type": "STRING"}, "description": "핵심 발견/기여 리스트"},
-            "materials":       {"type": "ARRAY",   "items": {"type": "STRING"}, "description": "언급된 주요 소재/화합물"},
-            "techniques":      {"type": "ARRAY",   "items": {"type": "STRING"}, "description": "분석·공정·측정 기법"},
-            "major_category":  {"type": "STRING",  "description": "resin|pr|develop_etch|litho|metrology|misc_semi|novel_idea 중 하나"},
-            "mid_category":    {"type": "STRING",  "description": "중분류"},
-            "sub_category":    {"type": "STRING",  "description": "소분류"},
-            "tags":            {"type": "ARRAY",   "items": {"type": "STRING"}, "description": "자유 태그 3-6개"},
-            "novelty_score":   {"type": "INTEGER", "description": "신선도/독창성 0-10"},
-            "relevance_score": {"type": "INTEGER", "description": "반도체 소재 관련성 0-10"},
+            "relevance": {
+                "type": "STRING",
+                "description": "yes | no | unsure",
+                "enum": ["yes", "no", "unsure"],
+            },
+            "paper_type": {
+                "type": "STRING",
+                "description": "composition | reaction | process | other | unknown",
+                "enum": ["composition", "reaction", "process", "other", "unknown"],
+            },
+            "reason": {
+                "type": "STRING",
+                "description": "간단한 판단 근거(20자 내외)",
+            },
         },
-        "required": ["summary_ko", "key_findings", "major_category", "mid_category", "novelty_score", "relevance_score"],
+        "required": ["relevance", "paper_type"],
     }
+
+# 옛 이름 호환 (혹시 외부 스크립트에서 참조).
+# v1 의 무거운 ANALYSIS_SCHEMA(summary_ko/key_findings/materials/...) 는
+# Layer 4 (Claude deep parser) 로 이관되었음. 외부에서 import 시 깨지지 않게 alias 만 유지.
+ANALYSIS_SCHEMA = RELEVANCE_SCHEMA
