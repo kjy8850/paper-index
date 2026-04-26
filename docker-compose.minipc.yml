@@ -72,12 +72,21 @@ services:
       GEMINI_CONCURRENCY:     ${GEMINI_CONCURRENCY:-3}
       GEMINI_MIN_INTERVAL_MS: ${GEMINI_MIN_INTERVAL_MS:-400}
 
-      # --- 수집 파라미터 ---
+      # --- 수집 파라미터 (Phase 1/2 분기) ---
       DAILY_TARGET:    ${DAILY_TARGET:-300}
       MAX_PER_SOURCE:  ${MAX_PER_SOURCE:-50}
       INGEST_API_KEY:  ${INGEST_API_KEY:?INGEST_API_KEY_설정_필요}
+      STAGING_INSERT_CONCURRENCY: ${STAGING_INSERT_CONCURRENCY:-8}
+      PHASE1_DAILY_TARGET:   ${PHASE1_DAILY_TARGET:-300}
+      PHASE1_TIMEOUT_HOURS:  ${PHASE1_TIMEOUT_HOURS:-20}
+      PHASE1_MIN_BATCH:      ${PHASE1_MIN_BATCH:-50}
+      PHASE1_PER_KEYWORD:    ${PHASE1_PER_KEYWORD:-50}
+      PHASE1_CALL_BUDGET_MS: ${PHASE1_CALL_BUDGET_MS:-90000}
+      PHASE1_CALL_MAX_ITER:  ${PHASE1_CALL_MAX_ITER:-16}
+      PHASE2_DAYS_WINDOW:    ${PHASE2_DAYS_WINDOW:-14}
 
-      # --- Semantic Scholar 선택 ---
+      # --- 외부 소스 ---
+      OPENALEX_EMAIL:           ${OPENALEX_EMAIL:-almexf88@gmail.com}
       SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
 
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -200,6 +209,74 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # -------------------------------------------------------------------
+  # publisher : Layer 5 — papers_parsed → research_papers + 임베딩
+  # -------------------------------------------------------------------
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paper-publisher
+    command: ["node", "src/publisher.js"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PGHOST:     ${PGHOST}
+      PGPORT:     ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-papers}
+      PGUSER:     ${PGUSER:-paperuser}
+      PGPASSWORD: ${PGPASSWORD}
+      GEMINI_API_KEY:     ${GEMINI_API_KEY}
+      GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-text-embedding-004}
+      GEMINI_CONCURRENCY: ${GEMINI_CONCURRENCY:-3}
+      PUBLISHER_POLL_MS:  ${PUBLISHER_POLL_MS:-20000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV:  production
+      TZ:        ${TZ:-Asia/Seoul}
+    depends_on:
+      - ingest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # -------------------------------------------------------------------
+  # claude-parser : Layer 4 — Claude Sonnet Deep Parser
+  # md_ready / queued 상태의 staging 행을 잡아 JSON 추출
+  # -------------------------------------------------------------------
+  claude-parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paper-claude-parser
+    command: ["node", "src/deep-parser.js"]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PGHOST:     ${PGHOST}
+      PGPORT:     ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-papers}
+      PGUSER:     ${PGUSER:-paperuser}
+      PGPASSWORD: ${PGPASSWORD}
+      ANTHROPIC_API_KEY:        ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY_설정_필요}
+      CLAUDE_MODEL:             ${CLAUDE_MODEL:-claude-sonnet-4-6}
+      CLAUDE_MAX_OUTPUT_TOKENS: ${CLAUDE_MAX_OUTPUT_TOKENS:-4096}
+      DEEP_PARSER_BATCH:        ${DEEP_PARSER_BATCH:-4}
+      DEEP_PARSER_POLL_MS:      ${DEEP_PARSER_POLL_MS:-15000}
+      DEEP_PARSER_MD_MAX:       ${DEEP_PARSER_MD_MAX:-200000}
+      DAILY_PDF_LIMIT:          ${DAILY_PDF_LIMIT:-10}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV:  production
+      TZ:        ${TZ:-Asia/Seoul}
+    depends_on:
+      - ingest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   scheduler:
     image: mcuadros/ofelia:latest

@@ -170,8 +170,8 @@ daily-trigger: ## 수동으로 하루치 수집 트리거
 pdf-stats: ## fulltext_status 분포 + 배치 잡 현황
 	docker exec batch-runner python -m batch_runner status
 
-pdf-retry-failed: ## failed 상태 논문을 pending으로 되돌려 재시도
-	./scripts/nas-psql.sh "UPDATE research_papers SET fulltext_status='pending', fulltext_error=NULL WHERE fulltext_status='failed';"
+pdf-retry-failed: ## failed 상태 papers_staging 을 pending으로 되돌려 재시도
+	./scripts/nas-psql.sh "UPDATE papers_staging SET fulltext_status='pending', fulltext_error=NULL WHERE fulltext_status='failed';"
 
 batch-now: ## 즉시 enqueue + submit (배치 수동 제출)
 	docker exec batch-runner python -m batch_runner enqueue && \
@@ -193,10 +193,105 @@ logs-batch: ## batch-runner 로그
 logs-scheduler: ## ofelia 스케줄러 로그
 	docker compose -f $(MINIPC_COMPOSE) logs -f --tail=100 scheduler
 
+# =====================================================================
+# v2 — 5-Layer Pipeline 운영
+# =====================================================================
+migrate: ## sql/migrations/*.sql 적용 (idempotent)
+	node scripts/migrate.js
+
+migrate-status: ## 마이그레이션 적용 현황
+	node scripts/migrate.js --status
+
+migrate-dry: ## 마이그레이션 dry-run (어떤 파일이 적용될지)
+	node scripts/migrate.js --dry
+
+phase-status: ## ingest /api/status 한 번 호출 + 정리
+	@curl -sf http://localhost:8787/api/status | jq '{phase:.phaseState,papers:.papers,cost:.cost.spent_usd}'
+
+phase1-trigger: ## 한 번 강제로 Phase 1 호출 (디버깅용)
+	@curl -sf -X POST http://localhost:8787/ingest/run-phase \
+	  -H "x-api-key: $$(grep INGEST_API_KEY .env | cut -d= -f2)" \
+	  -H "Content-Type: application/json" \
+	  -d '{"phase":"phase1","maxBudgetMs":60000,"maxIterations":12}' | jq .
+
+phase2-trigger: ## 한 번 강제로 Phase 2 호출
+	@curl -sf -X POST http://localhost:8787/ingest/run-phase \
+	  -H "x-api-key: $$(grep INGEST_API_KEY .env | cut -d= -f2)" \
+	  -H "Content-Type: application/json" \
+	  -d '{"phase":"phase2"}' | jq .
+
+phase1-complete: ## Phase 1 종료 강제 (수동)
+	@curl -sf -X POST http://localhost:8787/ingest/phase1/complete \
+	  -H "x-api-key: $$(grep INGEST_API_KEY .env | cut -d= -f2)" | jq .
+
+backfill-dry: ## 200건 backfill 후보 카운트만
+	node scripts/backfill-parse.js --dry
+
+backfill: ## 200건 backfill 큐잉 (Phase 1 완료 후 사용)
+	node scripts/backfill-parse.js --enqueue
+
+backfill-status: ## backfill 진행률
+	node scripts/backfill-parse.js --status
+
+backfill-reset: ## 큐잉했던 backfill 원복 (실수 복구)
+	node scripts/backfill-parse.js --reset
+
+claude-parser-up: ## claude-parser 단독 기동
+	docker compose -f $(MINIPC_COMPOSE) up -d --build claude-parser
+
+claude-parser-logs: ## claude-parser 로그
+	docker compose -f $(MINIPC_COMPOSE) logs -f --tail=200 claude-parser
+
+claude-parser-restart: ## claude-parser 재기동
+	docker compose -f $(MINIPC_COMPOSE) restart claude-parser
+
+pipeline-status: ## v_pipeline_status 보기
+	./scripts/nas-psql.sh "SELECT * FROM v_pipeline_status;"
+
+layer4-today: ## Layer 4 오늘 처리량/비용
+	./scripts/nas-psql.sh "SELECT * FROM v_layer4_today;"
+
+cost-today-v2: ## v_daily_cost (Gemini + Claude)
+	./scripts/nas-psql.sh "SELECT * FROM v_daily_cost ORDER BY day DESC LIMIT 7;"
+
+excluded-recent: ## 최근 24h 내 papers_excluded 샘플
+	./scripts/nas-psql.sh "SELECT excluded_at, excluded_layer, excluded_reason, LEFT(COALESCE(title_normalized,'-'),60) AS title FROM papers_excluded WHERE excluded_at > now() - interval '24 hours' ORDER BY excluded_at DESC LIMIT 20;"
+
+# =====================================================================
+# Layer 5 — Publisher (papers_parsed → research_papers + embedding)
+# =====================================================================
+publisher-up: ## publisher 단독 기동
+	docker compose -f $(MINIPC_COMPOSE) up -d --build publisher
+
+publisher-logs: ## publisher 로그
+	docker compose -f $(MINIPC_COMPOSE) logs -f --tail=200 publisher
+
+publisher-restart: ## publisher 재기동
+	docker compose -f $(MINIPC_COMPOSE) restart publisher
+
+publish-pending: ## publish 대기/완료 분포
+	./scripts/nas-psql.sh "SELECT * FROM v_publisher_summary;"
+
+publish-recent: ## 최근 publish 된 research_papers 10건
+	./scripts/nas-psql.sh "SELECT id, staging_id, LEFT(title,70) AS title, major_category, published_v2_at FROM research_papers WHERE published_v2_at IS NOT NULL ORDER BY published_v2_at DESC LIMIT 10;"
+
+# =====================================================================
+# 운영 보강 — 잠금 자동 복구
+# =====================================================================
+recover-stuck: ## parsing/pdf_running 으로 30분 이상 갇힌 행을 원위치
+	./scripts/nas-psql.sh "SELECT * FROM recover_stuck_staging(30);"
+
 .PHONY: help bootstrap env install deps \
         nas-check nas-bootstrap nas-mount nas-mount-persist nas-umount nas-sync nas-sync-dry \
         nas-up nas-down nas-restart nas-ps nas-logs nas-psql nas-count nas-reindex \
         up up-mcp down restart logs logs-ingest logs-n8n ps health \
         test-gemini test-search collect-once stats errors recent daily-trigger \
         pdf-stats pdf-retry-failed batch-now batch-poll cost-today cost-history \
-        logs-batch logs-scheduler
+        logs-batch logs-scheduler \
+        migrate migrate-status migrate-dry phase-status \
+        phase1-trigger phase2-trigger phase1-complete \
+        backfill-dry backfill backfill-status backfill-reset \
+        claude-parser-up claude-parser-logs claude-parser-restart \
+        pipeline-status layer4-today cost-today-v2 excluded-recent \
+        publisher-up publisher-logs publisher-restart publish-pending publish-recent \
+        recover-stuck
