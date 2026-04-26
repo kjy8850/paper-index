@@ -67,8 +67,8 @@ services:
 
       # --- Gemini ---
       GEMINI_API_KEY:         ${GEMINI_API_KEY:?GEMINI_API_KEY_설정_필요}
-      GEMINI_GEN_MODEL:       ${GEMINI_GEN_MODEL:-gemini-2.5-flash}
-      GEMINI_EMBED_MODEL:     ${GEMINI_EMBED_MODEL:-text-embedding-004}
+      GEMINI_GEN_MODEL:       ${GEMINI_GEN_MODEL:-gemini-2.5-flash-lite}
+      GEMINI_EMBED_MODEL:     ${GEMINI_EMBED_MODEL:-gemini-embedding-001}
       GEMINI_CONCURRENCY:     ${GEMINI_CONCURRENCY:-3}
       GEMINI_MIN_INTERVAL_MS: ${GEMINI_MIN_INTERVAL_MS:-400}
 
@@ -118,7 +118,7 @@ services:
       PGUSER:     ${PGUSER:-paperuser}
       PGPASSWORD: ${PGPASSWORD}
       GEMINI_API_KEY:     ${GEMINI_API_KEY}
-      GEMINI_GEN_MODEL:   ${GEMINI_GEN_MODEL:-gemini-2.5-flash}
+      GEMINI_GEN_MODEL:   ${GEMINI_GEN_MODEL:-gemini-2.5-flash-lite}
       GEMINI_EMBED_MODEL: ${GEMINI_EMBED_MODEL:-text-embedding-004}
       MCP_HTTP_PORT:      ${MCP_HTTP_PORT:-8788}
       MCP_HTTP_TOKEN:     ${MCP_HTTP_TOKEN:?Claude_Web_전용_공유토큰}
@@ -174,6 +174,49 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # -------------------------------------------------------------------
+  # batch-runner : md_ready/no_pdf → Gemini Batch API 제출/적용
+  # -------------------------------------------------------------------
+  batch-runner:
+    build: ./services/batch-runner
+    container_name: batch-runner
+    entrypoint: ["sleep", "infinity"]
+    env_file: .env
+    environment:
+      BATCH_MODEL:      ${BATCH_MODEL:-gemini-2.5-flash-lite}
+      BATCH_MAX_PAPERS: ${BATCH_MAX_PAPERS:-200}
+      BATCH_MIN_PAPERS: ${BATCH_MIN_PAPERS:-1}
+      GCS_BUCKET:       ${GCS_BUCKET:?GCS_BUCKET_설정_필요}
+      GCP_PROJECT:      ${GCP_PROJECT:?GCP_PROJECT_설정_필요}
+      GCP_LOCATION:     ${GCP_LOCATION:-us-central1}
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-key.json
+    volumes:
+      - ./services/batch-runner/gcp-key.json:/app/gcp-key.json:ro
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: paper-scheduler
+    restart: unless-stopped
+    depends_on:
+      - batch-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./services/batch-runner/ofelia.ini:/etc/ofelia/config.ini:ro
+    command: daemon --config=/etc/ofelia/config.ini
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
 volumes:
   n8n_data:

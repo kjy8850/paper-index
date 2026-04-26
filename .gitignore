@@ -8,3 +8,6 @@ dist/
 .vscode/
 .idea/
 data/
+gcp-key.json
+.env.nas
+*.tar.gz

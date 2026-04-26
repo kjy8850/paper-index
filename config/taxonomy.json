@@ -1,71 +1,39 @@
 {
-  "_comment": "대분류는 고정. 중/소분류는 Gemini 가 기존 라벨에서 고르되, 없으면 새로 제안. 주기적으로 merge.",
-  "version": 1,
+  "_comment": "3단계 계층 분류 체계: Core Area (Major) / Technology Generation (Mid) / Goal (Sub)",
+  "version": 2,
   "major_categories": [
     {
-      "id": "resin",
-      "label_ko": "포토레지스트 레진",
-      "label_en": "Resin in Photoresist",
-      "keywords": ["resin", "polymer", "base resin", "matrix polymer", "poly(hydroxystyrene)", "methacrylate polymer"],
+      "id": "resin_synthesis",
+      "label_ko": "수지 및 모노머 합성",
+      "label_en": "Resin & Monomer Synthesis",
+      "keywords": ["monomer", "polymer synthesis", "polycondensation", "radical polymerization", "molecular glass", "resin structure"],
       "priority": 10
     },
     {
-      "id": "pr",
-      "label_ko": "포토레지스트 (전체)",
-      "label_en": "Photoresist",
-      "keywords": ["photoresist", "chemically amplified resist", "CAR", "EUV resist", "DUV resist", "metal oxide resist", "MOR"],
+      "id": "resist_formulation",
+      "label_ko": "레지스트 및 포뮬레이션",
+      "label_en": "Resist Formulation & Chemistry",
+      "keywords": ["photoresist", "PAG", "quencher", "additive", "formulation", "CAR", "metal-oxide cluster", "MOR"],
       "priority": 9
     },
     {
-      "id": "develop_etch",
-      "label_ko": "현상/에칭",
-      "label_en": "Development & Etching",
-      "keywords": ["develop", "development", "TMAH", "etch", "etching", "dry etch", "plasma etch", "wet etch"],
+      "id": "litho_process",
+      "label_ko": "리소그래피 및 공정",
+      "label_en": "Lithography & Process",
+      "keywords": ["lithography", "exposure", "development", "etch", "patterning", "dose", "stochastics"],
       "priority": 8
     },
     {
-      "id": "litho",
-      "label_ko": "리소그래피",
-      "label_en": "Lithography",
-      "keywords": ["lithography", "EUV", "DUV", "immersion", "stepper", "scanner", "mask", "OPC"],
+      "id": "ancillary_metrology",
+      "label_ko": "보조 소재 및 계측",
+      "label_en": "Ancillary Materials & Metrology",
+      "keywords": ["pellicle", "hardmask", "SOC", "metrology", "CD-SEM", "CMP", "thin film", "characterization"],
       "priority": 7
-    },
-    {
-      "id": "metrology",
-      "label_ko": "계측/분석",
-      "label_en": "Metrology & Characterization",
-      "keywords": ["CD-SEM", "AFM", "XPS", "FTIR", "GPC", "TGA", "scatterometry"],
-      "priority": 5
-    },
-    {
-      "id": "misc_semi",
-      "label_ko": "반도체 일반/공정",
-      "label_en": "Semiconductor Materials & Process",
-      "keywords": ["CMP", "ALD", "CVD", "thin film", "interconnect", "low-k", "hard mask", "SOC"],
-      "priority": 4
-    },
-    {
-      "id": "novel_idea",
-      "label_ko": "독창적/신선한 아이디어",
-      "label_en": "Novel Ideas",
-      "keywords": [],
-      "priority": 3,
-      "note": "위 카테고리에 깔끔히 속하지 않지만 창의적·신선하다고 LLM 이 판단한 논문"
     }
   ],
   "example_mid_sub_categories": {
-    "_note": "이것은 참고용 예시. Gemini 는 이 중에서 고르거나 새로 제안. 주기적으로 DB 에서 실제 라벨을 읽어 동기화.",
-    "resin": {
-      "mid": ["ArF CAR resin", "EUV polymer resin", "Molecular glass", "Inorganic hybrid resin"],
-      "sub": ["Low LER resin", "High sensitivity resin", "Low outgassing resin"]
-    },
-    "pr": {
-      "mid": ["EUV PR", "DUV PR", "e-beam resist", "Negative tone PR", "Positive tone PR"],
-      "sub": ["PAG development", "Quencher study", "Metal contamination"]
-    },
-    "develop_etch": {
-      "mid": ["TMAH development", "Organic development", "Plasma etch selectivity"],
-      "sub": ["Pattern collapse", "LER reduction", "Defect mitigation"]
-    }
+    "_note": "Mid 는 Generation(세대), Sub 는 Problem-Solving(해결과제) 중심",
+    "generation_mid": ["EUV", "High-NA EUV", "DUV (ArF/KrF)", "Next-Gen (DSA/NIL)", "General"],
+    "goal_sub": ["Performance (LER/Sensitivity/Resolution)", "Property (Etch/Thermal/Solubility)", "Mechanism (Reaction/Physics)"]
   }
 }

@@ -8,9 +8,25 @@
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import pLimit from 'p-limit';
 import { logger } from './logger.js';
+import { query } from './db.js';
+
+// gemini-2.5-flash-lite 단가 (실시간 / 비배치)
+const GEN_PRICE = { input: 0.10, output: 0.40 }; // per 1M tokens
+
+async function recordUsage(inputTokens, outputTokens, endpoint) {
+  const cost = (inputTokens / 1_000_000) * GEN_PRICE.input
+             + (outputTokens / 1_000_000) * GEN_PRICE.output;
+  try {
+    await query(
+      `INSERT INTO api_usage (model, endpoint, is_batch, input_tokens, output_tokens, cost_usd, caller)
+       VALUES ($1, $2, false, $3, $4, $5, 'gemini-realtime')`,
+      [MODEL_NAME, endpoint, inputTokens, outputTokens, cost],
+    );
+  } catch (_) {}
+}
 
 const API_KEY    = process.env.GEMINI_API_KEY;
-const MODEL_NAME = process.env.GEMINI_GEN_MODEL ?? 'gemini-2.5-flash';
+const MODEL_NAME = process.env.GEMINI_GEN_MODEL ?? 'gemini-2.5-flash-lite';
 
 if (!API_KEY) {
   logger.warn('GEMINI_API_KEY 가 비어있습니다. 이 상태로는 Gemini 호출이 실패합니다.');
@@ -59,12 +75,12 @@ const paperAnalysisSchema = {
 };
 
 const ALLOWED_MAJORS = new Set([
-  'resin', 'pr', 'develop_etch', 'litho', 'metrology', 'misc_semi', 'novel_idea',
+  'resin_synthesis', 'resist_formulation', 'litho_process', 'ancillary_metrology',
 ]);
 
 function sanitizeAnalysis(obj) {
   const clean = { ...obj };
-  if (!ALLOWED_MAJORS.has(clean.major_category)) clean.major_category = 'misc_semi';
+  if (!ALLOWED_MAJORS.has(clean.major_category)) clean.major_category = 'ancillary_metrology';
   clean.novelty_score   = clampInt(clean.novelty_score, 0, 10);
   clean.relevance_score = clampInt(clean.relevance_score, 0, 10);
   clean.key_findings = Array.isArray(clean.key_findings) ? clean.key_findings.slice(0, 10) : [];
@@ -134,7 +150,8 @@ export async function analyzePaper(paper, taxonomy) {
         major_categories: taxonomy.major_categories.map((m) => ({
           id: m.id, label_en: m.label_en, label_ko: m.label_ko,
         })),
-        mid_sub_examples: taxonomy.example_mid_sub_categories,
+        mid_generation_examples: taxonomy.example_mid_sub_categories.generation_mid,
+        sub_goal_examples: taxonomy.example_mid_sub_categories.goal_sub,
       },
       null, 2,
     );
@@ -146,13 +163,16 @@ export async function analyzePaper(paper, taxonomy) {
 
     const prompt = `당신은 반도체 소재(특히 포토레지스트) 분야 논문을 분류·요약하는 전문 큐레이터입니다.
 
-[분류 체계] (major_category 는 반드시 아래 id 중 하나):
+[분류 체계] (반드시 아래 계층 구조를 따를 것):
+1. Major (Core Area): 반드시 아래 id 중 하나 선택
 ${taxonomyHint}
+
+2. Mid (Generation): 해당 기술이 겨냥하는 세대 (EUV, DUV, Next-Gen 등)
+3. Sub (Problem-Solving): 연구의 주된 목적 (성능 개선, 물성 확보, 메커니즘 연구 등)
 
 [요구사항]
 - 요약은 한국어 3-4줄. 결론과 실용적 의미 포함.
 - key_findings 는 구체적인 수치/비교를 포함.
-- mid/sub 라벨은 예시 중 최대한 고르고, 명확히 없으면 새 라벨 제안 (영문 명사구).
 - 반드시 포토레지스트·리소·에칭·반도체 소재 관점으로 해석.
 - novelty_score 는 '방법론적 신선함', relevance_score 는 '우리 관심 키워드 적합도'.
 
@@ -207,6 +227,8 @@ ${majorHints}
 ${userQuestion}
 `;
     const res = await model.generateContent(prompt);
+    const usage = res.response?.usageMetadata ?? {};
+    recordUsage(usage.promptTokenCount ?? 0, usage.candidatesTokenCount ?? 0, 'rewriteQuery');
     const out = JSON.parse(res.response.text());
     return {
       rewritten: String(out.rewritten ?? userQuestion),
@@ -238,6 +260,8 @@ ${userQuestion}
 ${context}
 `;
     const res = await model.generateContent(prompt);
+    const usage = res.response?.usageMetadata ?? {};
+    recordUsage(usage.promptTokenCount ?? 0, usage.candidatesTokenCount ?? 0, 'synthesizeAnswer');
     return res.response.text();
   }, { label: 'synthesizeAnswer' }));
 }

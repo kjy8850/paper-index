@@ -22,15 +22,20 @@ fi
 : "${PGDATABASE:?PGDATABASE 미설정}"
 : "${PGPASSWORD:?PGPASSWORD 미설정}"
 
-# docker 로 psql 을 일회성 실행 (로컬에 psql 설치 없어도 OK)
-if [[ $# -gt 0 ]]; then
-  docker run --rm -i \
-    -e PGPASSWORD \
-    postgres:16-alpine \
-    psql -h "${PGHOST}" -p "${PGPORT:-5432}" -U "${PGUSER}" -d "${PGDATABASE}" -c "$*"
+# psql 직접 실행 (로컬 설치 우선, 없으면 docker --network host)
+PSQL_CMD=(psql -h "${PGHOST}" -p "${PGPORT:-5432}" -U "${PGUSER}" -d "${PGDATABASE}")
+if command -v psql &>/dev/null; then
+  if [[ $# -gt 0 ]]; then
+    PGPASSWORD="${PGPASSWORD}" "${PSQL_CMD[@]}" -c "$*"
+  else
+    PGPASSWORD="${PGPASSWORD}" "${PSQL_CMD[@]}"
+  fi
 else
-  docker run --rm -it \
-    -e PGPASSWORD \
-    postgres:16-alpine \
-    psql -h "${PGHOST}" -p "${PGPORT:-5432}" -U "${PGUSER}" -d "${PGDATABASE}"
+  if [[ $# -gt 0 ]]; then
+    docker run --rm -i --network host \
+      -e PGPASSWORD postgres:16-alpine "${PSQL_CMD[@]}" -c "$*"
+  else
+    docker run --rm -it --network host \
+      -e PGPASSWORD postgres:16-alpine "${PSQL_CMD[@]}"
+  fi
 fi

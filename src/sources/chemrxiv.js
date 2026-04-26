@@ -22,7 +22,7 @@ export async function searchChemRxiv({ query, max = 30, daysWindow, categoryHint
 
   try {
     const { statusCode, body } = await request(url, {
-      headers: { accept: 'application/json' },
+      headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0 (compatible; paper-index/1.0)' },
       headersTimeout: 15_000, bodyTimeout: 30_000,
     });
     if (statusCode !== 200) {

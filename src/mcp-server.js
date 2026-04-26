@@ -87,9 +87,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
-  ],
-}));
-
+    {
+      name: 'read_code_file',
+      description: '시스템의 소스 코드 파일을 직접 읽어옵니다.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '읽을 파일의 경로 (예: src/pdf-worker.js, services/batch-runner/batch_runner/pipeline.py)' },
+        },
+        required: ['path'],
+      },
+    },
+    ],
+    };
+    });
 // =====================================================================
 // 툴 실행
 // =====================================================================
@@ -117,6 +128,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'recent_papers': {
         const rows = await fetchRecent(args ?? {});
         return { content: [{ type: 'text', text: formatRecent(rows) }] };
+      }
+
+      case 'read_code_file': {
+        const fs = await import('fs/promises');
+        const path = await import('path');
+        const safePath = path.normalize(args.path).replace(/^(\.\.(\/|\\|$))+/, '');
+        const fullPath = path.join(process.cwd(), safePath);
+        try {
+          const content = await fs.readFile(fullPath, 'utf-8');
+          return { content: [{ type: 'text', text: content }] };
+        } catch (err) {
+          return { content: [{ type: 'text', text: `파일 읽기 실패: ${err.message}` }], isError: true };
+        }
       }
 
       default:

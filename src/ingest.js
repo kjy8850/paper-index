@@ -15,10 +15,184 @@ import pLimit from 'p-limit';
 
 import { logger, childLogger } from './lib/logger.js';
 import { query, toVectorLiteral, ping, close } from './lib/db.js';
-import { analyzePaper } from './lib/gemini.js';
 import { embedText } from './lib/embedding.js';
-import { loadTaxonomy, loadKeywords } from './lib/config.js';
+import { loadKeywords } from './lib/config.js';
 import { searchAll, dedupeKey } from './sources/index.js';
+
+// =====================================================================
+// 대시보드 HTML
+// =====================================================================
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Index 대시보드</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 16px; }
+  h1 { font-size: 1.25rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+  .subtitle { font-size: 0.75rem; color: #64748b; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; }
+  .card h2 { font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+             letter-spacing: 0.08em; color: #94a3b8; margin-bottom: 12px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+           border-radius: 99px; font-size: 0.75rem; font-weight: 600; margin: 3px; }
+  .badge-green  { background: #14532d; color: #86efac; }
+  .badge-blue   { background: #1e3a5f; color: #93c5fd; }
+  .badge-yellow { background: #713f12; color: #fde68a; }
+  .badge-red    { background: #7f1d1d; color: #fca5a5; }
+  .badge-gray   { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+  .cost-big { font-size: 2rem; font-weight: 700; color: #34d399; }
+  .cost-sub { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+  .batch-row { padding: 8px 0; border-bottom: 1px solid #1e293b; font-size: 0.78rem; }
+  .batch-row:last-child { border-bottom: none; }
+  .batch-state { font-weight: 600; font-size: 0.7rem; }
+  .state-succeeded { color: #34d399; }
+  .state-pending   { color: #fbbf24; }
+  .state-queued    { color: #60a5fa; }
+  .state-running   { color: #a78bfa; }
+  .state-failed    { color: #f87171; }
+  .error-box { background: #450a0a; border: 1px solid #7f1d1d; border-radius: 8px;
+               padding: 10px; font-size: 0.72rem; color: #fca5a5; margin-top: 8px;
+               word-break: break-all; }
+  .ts { font-size: 0.65rem; color: #475569; margin-top: 16px; text-align: right; }
+  .refresh-btn { background: #334155; border: none; color: #94a3b8; padding: 6px 14px;
+                 border-radius: 8px; font-size: 0.75rem; cursor: pointer; float: right; }
+  .refresh-btn:hover { background: #475569; color: #e2e8f0; }
+  .alert-banner { background: #450a0a; border: 1px solid #991b1b; border-radius: 10px;
+                  padding: 12px 16px; margin-bottom: 16px; color: #fca5a5;
+                  font-size: 0.8rem; display: none; }
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+  <h1>📄 Paper Index</h1>
+  <button class="refresh-btn" onclick="load()">↻ 새로고침</button>
+</div>
+<div class="subtitle" id="ts">로딩 중...</div>
+<div class="alert-banner" id="alert"></div>
+<div class="grid" id="grid"></div>
+
+<script>
+const STATE_CLASS = {
+  JOB_STATE_SUCCEEDED: 'state-succeeded',
+  JOB_STATE_FAILED:    'state-failed',
+  JOB_STATE_PENDING:   'state-pending',
+  JOB_STATE_QUEUED:    'state-queued',
+  JOB_STATE_RUNNING:   'state-running',
+  PENDING: 'state-pending', RUNNING: 'state-running',
+};
+const STATUS_BADGE = {
+  batch_done:       'badge-green',
+  md_ready:         'badge-blue',
+  pending:          'badge-blue',
+  batch_submitted:  'badge-yellow',
+  none:             'badge-gray',
+  failed:           'badge-red',
+  no_pdf:           'badge-gray',
+};
+function fmt(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  return d.toLocaleString('ko-KR', { timeZone: 'Asia/Seoul',
+    month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+}
+function elapsed(iso) {
+  if (!iso) return '';
+  const s = Math.round((Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return s + '초 전';
+  if (s < 3600) return Math.round(s/60) + '분 전';
+  return Math.round(s/3600) + '시간 전';
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    render(d);
+  } catch(e) {
+    document.getElementById('ts').textContent = '로드 실패: ' + e.message;
+  }
+}
+
+function render(d) {
+  document.getElementById('ts').textContent = '마지막 갱신: ' + fmt(d.ts);
+
+  // 실패 배너
+  const failed = d.batches.filter(b => b.state === 'JOB_STATE_FAILED');
+  const alert = document.getElementById('alert');
+  if (failed.length) {
+    alert.style.display = 'block';
+    alert.innerHTML = '⚠️ 실패한 배치 ' + failed.length + '건 — Claude Code에서 확인 필요';
+  } else { alert.style.display = 'none'; }
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  // 논문 상태 카드
+  const paperCard = document.createElement('div');
+  paperCard.className = 'card';
+  const total = d.papers.reduce((s, r) => s + r.cnt, 0);
+  paperCard.innerHTML = '<h2>논문 현황 (총 ' + total + '건)</h2>' +
+    d.papers.map(r =>
+      '<span class="badge ' + (STATUS_BADGE[r.fulltext_status] || 'badge-gray') + '">' +
+      r.fulltext_status + ' ' + r.cnt + '</span>'
+    ).join('');
+  grid.appendChild(paperCard);
+
+  // 비용 카드
+  const cost = d.cost || {};
+  const costCard = document.createElement('div');
+  costCard.className = 'card';
+  costCard.innerHTML = '<h2>오늘 API 비용 (UTC)</h2>' +
+    '<div class="cost-big">$' + Number(cost.spent_usd || 0).toFixed(4) + '</div>' +
+    '<div class="cost-sub">입력 ' + (cost.input_tokens || 0).toLocaleString() +
+    ' tok / 출력 ' + (cost.output_tokens || 0).toLocaleString() + ' tok / ' +
+    (cost.calls || 0) + '회 호출</div>';
+  grid.appendChild(costCard);
+
+  // 배치 잡 카드
+  const batchCard = document.createElement('div');
+  batchCard.className = 'card';
+  batchCard.innerHTML = '<h2>배치 잡 (최근 10건)</h2>' +
+    (d.batches.length === 0 ? '<div style="color:#475569;font-size:.8rem">없음</div>' :
+    d.batches.map(b => {
+      const sc = STATE_CLASS[b.state] || 'state-pending';
+      const errs = Array.isArray(b.error_samples) ? b.error_samples : [];
+      return '<div class="batch-row">' +
+        '<div style="display:flex;justify-content:space-between">' +
+        '<span class="batch-state ' + sc + '">' + b.state.replace('JOB_STATE_','') + '</span>' +
+        '<span style="color:#64748b;font-size:.65rem">' + elapsed(b.submitted_at) + '</span></div>' +
+        '<div style="color:#94a3b8;margin-top:2px">논문 ' + b.request_count + '건' +
+        (b.success_count ? ' ✓' + b.success_count : '') +
+        (b.fail_count ? ' ✗' + b.fail_count : '') + '</div>' +
+        (errs.length ? '<div class="error-box">' + JSON.stringify(errs[0]).slice(0,120) + '</div>' : '') +
+        '</div>';
+    }).join(''));
+  grid.appendChild(batchCard);
+
+  // 실패 논문 카드
+  if (d.failedPapers && d.failedPapers.length) {
+    const errCard = document.createElement('div');
+    errCard.className = 'card';
+    errCard.innerHTML = '<h2>최근 실패 논문</h2>' +
+      d.failedPapers.map(p =>
+        '<div class="batch-row"><div style="font-size:.75rem;color:#cbd5e1">' +
+        (p.title || '').slice(0, 60) + '</div>' +
+        '<div class="error-box">' + (p.fulltext_error || 'unknown').slice(0,100) + '</div></div>'
+      ).join('');
+    grid.appendChild(errCard);
+  }
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>`;
 
 // =====================================================================
 // 공통 유틸
@@ -86,16 +260,17 @@ async function upsertPaper(ref, analysis, embedding) {
       authors         = EXCLUDED.authors,
       venue           = EXCLUDED.venue,
       citations       = EXCLUDED.citations,
-      summary_ko      = EXCLUDED.summary_ko,
-      key_findings    = EXCLUDED.key_findings,
-      materials       = EXCLUDED.materials,
-      techniques      = EXCLUDED.techniques,
-      novelty_score   = EXCLUDED.novelty_score,
-      relevance_score = EXCLUDED.relevance_score,
-      major_category  = EXCLUDED.major_category,
-      mid_category    = EXCLUDED.mid_category,
-      sub_category    = EXCLUDED.sub_category,
-      tags            = EXCLUDED.tags,
+      -- 분석 필드: 이미 채워진 값은 보존 (batch 결과가 ingest 재수집으로 지워지는 것 방지)
+      summary_ko      = COALESCE(research_papers.summary_ko,      EXCLUDED.summary_ko),
+      key_findings    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.key_findings    ELSE EXCLUDED.key_findings    END,
+      materials       = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.materials       ELSE EXCLUDED.materials       END,
+      techniques      = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.techniques      ELSE EXCLUDED.techniques      END,
+      novelty_score   = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.novelty_score   ELSE EXCLUDED.novelty_score   END,
+      relevance_score = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.relevance_score ELSE EXCLUDED.relevance_score END,
+      major_category  = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.major_category  ELSE EXCLUDED.major_category  END,
+      mid_category    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.mid_category    ELSE EXCLUDED.mid_category    END,
+      sub_category    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.sub_category    ELSE EXCLUDED.sub_category    END,
+      tags            = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.tags            ELSE EXCLUDED.tags            END,
       embedding       = EXCLUDED.embedding,
       updated_at      = now()
     RETURNING id;
@@ -118,28 +293,61 @@ async function updateCategoryMaster(analysis) {
   ]);
 }
 
-/**
- * 단일 논문 처리: 분석 -> 임베딩 -> upsert.
- */
-async function ingestOne(ref, taxonomy, log) {
-  try {
-    const analysis  = await analyzePaper(
-      { title: ref.title, abstract: ref.abstract, fullText: ref.fullText },
-      taxonomy,
-    );
-    const embedText_ = [
-      ref.title,
-      analysis.summary_ko,
-      (analysis.key_findings ?? []).join(' '),
-      (analysis.materials ?? []).join(' '),
-      (analysis.techniques ?? []).join(' '),
-      ref.abstract ?? '',
-    ].filter(Boolean).join('\n');
+// 분석 없이 저장할 때 쓰는 빈 분석 객체 (Batch API가 나중에 채움)
+const EMPTY_ANALYSIS = {
+  summary_ko: null,
+  key_findings: [],
+  materials: [],
+  techniques: [],
+  novelty_score: 0,
+  relevance_score: 0,
+  major_category: 'misc_semi',
+  mid_category: null,
+  sub_category: null,
+  tags: [],
+};
 
-    const embedding = await embedText(embedText_, 'RETRIEVAL_DOCUMENT');
-    const id = await upsertPaper(ref, analysis, embedding);
-    await updateCategoryMaster(analysis);
-    log.info({ id, title: ref.title.slice(0, 60), major: analysis.major_category }, 'ingested');
+/**
+ * DB에 이미 존재하는지 식별자(DOI, Arxiv ID, Source+ID)로 체크.
+ */
+async function checkExists(ref) {
+  const conditions = [];
+  const params = [];
+
+  if (ref.doi) {
+    params.push(ref.doi);
+    conditions.push(`doi = $${params.length}`);
+  }
+  if (ref.arxiv_id) {
+    params.push(ref.arxiv_id);
+    conditions.push(`arxiv_id = $${params.length}`);
+  }
+  // Source + ID 조합도 체크
+  params.push(ref.source, ref.source_id);
+  conditions.push(`(source = $${params.length - 1} AND source_id = $${params.length})`);
+
+  const sql = `SELECT id FROM research_papers WHERE ${conditions.join(' OR ')} LIMIT 1`;
+  const { rows } = await query(sql, params);
+  return rows[0]?.id || null;
+}
+
+/**
+ * 단일 논문 처리: 중복 체크 -> 임베딩(title+abstract) → upsert. 분석은 Batch API에서 비동기 수행.
+ */
+async function ingestOne(ref, _taxonomy, log) {
+  try {
+    // 1) DB 존재 여부 먼저 체크 (토큰 아끼기)
+    const existingId = await checkExists(ref);
+    if (existingId) {
+      log.info({ id: existingId, title: ref.title.slice(0, 60) }, 'already exists, skipping embedding');
+      return { ok: true, id: existingId, skipped: true };
+    }
+
+    // 2) 존재하지 않을 때만 임베딩 API 호출
+    const textToEmbed = [ref.title, ref.abstract ?? ''].filter(Boolean).join('\n');
+    const embedding = await embedText(textToEmbed, 'RETRIEVAL_DOCUMENT');
+    const id = await upsertPaper(ref, EMPTY_ANALYSIS, embedding);
+    log.info({ id, title: ref.title.slice(0, 60) }, 'ingested (analysis queued for batch)');
     return { ok: true, id };
   } catch (err) {
     log.error({ err: err?.message, title: ref.title?.slice(0, 60) }, 'ingest 실패');
@@ -151,7 +359,6 @@ async function ingestOne(ref, taxonomy, log) {
 // /ingest/batch : PaperRef 배열 받아 처리
 // =====================================================================
 async function handleBatch(paperRefs) {
-  const taxonomy = await loadTaxonomy();
   const log = childLogger({ mod: 'batch' });
 
   const limit = pLimit(Number(process.env.GEMINI_CONCURRENCY ?? 3));
@@ -167,7 +374,7 @@ async function handleBatch(paperRefs) {
         errorSamples.push({ title: r?.title, error: parsed.error.errors[0]?.message });
         return { ok: false, error: 'validation' };
       }
-      const res = await ingestOne(parsed.data, taxonomy, log);
+      const res = await ingestOne(parsed.data, null, log);
       if (res.ok) ingested += 1;
       else { failed += 1; if (errorSamples.length < 5) errorSamples.push({ title: r.title, error: res.error }); }
       return res;
@@ -182,7 +389,6 @@ async function handleBatch(paperRefs) {
 // =====================================================================
 async function runDaily() {
   const log = childLogger({ mod: 'run-daily' });
-  const taxonomy = await loadTaxonomy();
   const keywords = await loadKeywords();
 
   const target = Number(process.env.DAILY_TARGET ?? 300);
@@ -251,11 +457,11 @@ export function buildApp() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // 간단한 API key 인증
+  // 간단한 API key 인증 (대시보드·헬스체크는 공개)
   app.use((req, res, next) => {
-    if (req.path === '/health') return next();
+    if (req.path === '/health' || req.path === '/dashboard' || req.path === '/api/status') return next();
     const expected = process.env.INGEST_API_KEY;
-    if (!expected) return next(); // 키 미설정 시 패스 (로컬)
+    if (!expected) return next();
     if (req.header('x-api-key') === expected) return next();
     return res.status(401).json({ error: 'unauthorized' });
   });
@@ -263,10 +469,42 @@ export function buildApp() {
   app.get('/health', async (_req, res) => {
     try {
       const ok = await ping();
-      res.json({ ok, gemini_model: process.env.GEMINI_GEN_MODEL ?? 'gemini-2.5-flash' });
+      res.json({ ok, gemini_model: process.env.GEMINI_GEN_MODEL ?? 'gemini-2.5-flash-lite' });
     } catch (err) {
       res.status(503).json({ ok: false, error: err.message });
     }
+  });
+
+  app.get('/api/status', async (_req, res) => {
+    try {
+      const [papers, batches, cost] = await Promise.all([
+        query(`SELECT fulltext_status, COUNT(*)::int AS cnt
+               FROM research_papers GROUP BY 1 ORDER BY 2 DESC`),
+        query(`SELECT id, job_name, state, request_count, success_count, fail_count,
+                      error_samples, submitted_at, completed_at, applied_at
+               FROM batch_jobs ORDER BY id DESC LIMIT 10`),
+        query(`SELECT spent_usd, input_tokens, output_tokens, calls FROM v_today_cost`),
+      ]);
+      const failedPapers = await query(
+        `SELECT id, title, fulltext_error, fulltext_attempts
+         FROM research_papers WHERE fulltext_status='failed'
+         ORDER BY id DESC LIMIT 5`
+      );
+      res.json({
+        papers: papers.rows,
+        batches: batches.rows,
+        cost: cost.rows[0],
+        failedPapers: failedPapers.rows,
+        ts: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/dashboard', (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(DASHBOARD_HTML);
   });
 
   app.post('/ingest/batch', async (req, res) => {

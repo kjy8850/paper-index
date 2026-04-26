@@ -103,7 +103,7 @@ nas-reindex: ## HNSW 벡터 인덱스 REINDEX (월간 유지보수)
 # =====================================================================
 # 미니PC 컨테이너 운영
 # =====================================================================
-up: ## 미니PC 컨테이너 기동 (n8n + ingest)
+up: ## 미니PC 컨테이너 전체 기동 (n8n + ingest + pdf-worker + batch-runner + scheduler)
 	docker compose -f $(MINIPC_COMPOSE) up -d --build
 
 up-mcp: ## + MCP HTTP 컨테이너까지 기동
@@ -164,8 +164,39 @@ daily-trigger: ## 수동으로 하루치 수집 트리거
 	@curl -sf -X POST http://localhost:8787/ingest/run-daily \
 	  -H "x-api-key: $$(grep INGEST_API_KEY .env | cut -d= -f2)" | jq .
 
+# =====================================================================
+# PDF 파이프라인 운영 (Phase 4-7)
+# =====================================================================
+pdf-stats: ## fulltext_status 분포 + 배치 잡 현황
+	docker exec batch-runner python -m batch_runner status
+
+pdf-retry-failed: ## failed 상태 논문을 pending으로 되돌려 재시도
+	./scripts/nas-psql.sh "UPDATE research_papers SET fulltext_status='pending', fulltext_error=NULL WHERE fulltext_status='failed';"
+
+batch-now: ## 즉시 enqueue + submit (배치 수동 제출)
+	docker exec batch-runner python -m batch_runner enqueue && \
+	docker exec batch-runner python -m batch_runner submit
+
+batch-poll: ## 배치 상태 폴링 + 완료분 DB 반영
+	docker exec batch-runner python -m batch_runner poll && \
+	docker exec batch-runner python -m batch_runner apply
+
+cost-today: ## 오늘 Gemini 비용 조회
+	./scripts/nas-psql.sh "SELECT * FROM v_today_cost;"
+
+cost-history: ## 최근 14일 일별 비용
+	./scripts/nas-psql.sh "SELECT DATE(ts) AS day, model, SUM(cost_usd) AS cost_usd, SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, COUNT(*) AS calls FROM api_usage GROUP BY 1,2 ORDER BY 1 DESC LIMIT 28;"
+
+logs-batch: ## batch-runner 로그
+	docker compose -f $(MINIPC_COMPOSE) logs -f --tail=100 batch-runner
+
+logs-scheduler: ## ofelia 스케줄러 로그
+	docker compose -f $(MINIPC_COMPOSE) logs -f --tail=100 scheduler
+
 .PHONY: help bootstrap env install deps \
         nas-check nas-bootstrap nas-mount nas-mount-persist nas-umount nas-sync nas-sync-dry \
         nas-up nas-down nas-restart nas-ps nas-logs nas-psql nas-count nas-reindex \
         up up-mcp down restart logs logs-ingest logs-n8n ps health \
-        test-gemini test-search collect-once stats errors recent daily-trigger
+        test-gemini test-search collect-once stats errors recent daily-trigger \
+        pdf-stats pdf-retry-failed batch-now batch-poll cost-today cost-history \
+        logs-batch logs-scheduler

@@ -1,0 +1,4 @@
+google-genai==0.8.*
+google-cloud-storage==2.19.*
+psycopg[binary]==3.2.*
+python-dotenv==1.0.*

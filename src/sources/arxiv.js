@@ -8,7 +8,7 @@ import { request } from 'undici';
 import { parseStringPromise } from 'xml2js';
 import { logger } from '../lib/logger.js';
 
-const BASE = 'http://export.arxiv.org/api/query';
+const BASE = 'https://export.arxiv.org/api/query';
 
 /**
  * @typedef {Object} PaperRef
@@ -37,9 +37,10 @@ const BASE = 'http://export.arxiv.org/api/query';
  * @returns {Promise<PaperRef[]>}
  */
 export async function searchArxiv({ query, max = 50, daysWindow, categoryHint }) {
-  // arXiv 쿼리는 search_query=all:"..." 형식.
-  const q = `all:"${query.replace(/"/g, '')}"`;
-  const url = `${BASE}?search_query=${encodeURIComponent(q)}&start=0&max_results=${max}&sortBy=submittedDate&sortOrder=descending`;
+  // 단어별 AND 검색 (exact phrase는 결과가 너무 적음)
+  const terms = query.replace(/"/g, '').trim().split(/\s+/);
+  const q = terms.map(t => `all:${t}`).join('+AND+');
+  const url = `${BASE}?search_query=${q}&start=0&max_results=${max}&sortBy=submittedDate&sortOrder=descending`;
 
   try {
     const { statusCode, body } = await request(url, { headersTimeout: 15_000, bodyTimeout: 30_000 });

@@ -6,6 +6,23 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import pLimit from 'p-limit';
 import { logger } from './logger.js';
+import { query } from './db.js';
+
+// gemini-embedding-001 단가: $0.15 / 1M tokens
+const PRICE_PER_1M = 0.15;
+
+async function recordUsage(inputTokens, model) {
+  const cost = (inputTokens / 1_000_000) * PRICE_PER_1M;
+  try {
+    await query(
+      `INSERT INTO api_usage (model, endpoint, is_batch, input_tokens, cost_usd, caller)
+       VALUES ($1, 'embedContent', false, $2, $3, 'embedding')`,
+      [model, inputTokens, cost],
+    );
+  } catch (_) {
+    // 비용 기록 실패는 무시 (주 기능에 영향 없어야 함)
+  }
+}
 
 const API_KEY    = process.env.GEMINI_API_KEY;
 const MODEL_NAME = process.env.GEMINI_EMBED_MODEL ?? 'text-embedding-004';
@@ -31,6 +48,20 @@ async function withRetry(fn, retries = 4) {
 }
 
 /**
+ * 비정상 유니코드 문자 제거 (ByteString 에러 방지)
+ */
+function sanitizeText(text) {
+  if (!text) return '';
+  // 1) null 문자 제거
+  // 2) 유효하지 않은 대리 쌍(surrogate pairs) 제거
+  // 3) 비정상 문자(U+FFFD) 제거
+  return text
+    .replace(/\0/g, '')
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g, '')
+    .replace(/\uFFFD/g, '');
+}
+
+/**
  * 텍스트 1건 임베딩.
  * @param {string} text
  * @param {'RETRIEVAL_DOCUMENT'|'RETRIEVAL_QUERY'|'SEMANTIC_SIMILARITY'} [taskType]
@@ -40,16 +71,24 @@ export async function embedText(text, taskType = 'RETRIEVAL_DOCUMENT') {
   if (!text || typeof text !== 'string') {
     throw new Error('embedText: invalid text');
   }
+  const cleanText = sanitizeText(text).slice(0, 8000);
+  if (!cleanText) return new Array(768).fill(0); // 빈 텍스트 방어
+
   return limit(() => withRetry(async () => {
     const model = genAI.getGenerativeModel({ model: MODEL_NAME });
     const result = await model.embedContent({
-      content: { role: 'user', parts: [{ text: text.slice(0, 8000) }] },
+      content: { role: 'user', parts: [{ text: cleanText }] },
       taskType,
+      outputDimensionality: 768,
     });
     const vec = result?.embedding?.values;
     if (!Array.isArray(vec) || vec.length === 0) {
       throw new Error('empty embedding');
     }
+    const inputTokens = result?.embedding?.metadata?.billableCharacterCount
+      ? Math.ceil(result.embedding.metadata.billableCharacterCount / 4)
+      : Math.ceil(text.length / 4);
+    recordUsage(inputTokens, MODEL_NAME);
     return vec;
   }));
 }

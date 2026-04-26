@@ -41,9 +41,10 @@ ok  "폴더 생성/권한 OK"
 
 say "파일 전송 (docker-compose.nas.yml → docker-compose.yml, sql/, .env)"
 # sync-to-nas.sh 와 동일한 규약: NAS 위에서는 docker-compose.yml 로 저장 (compose 기본 파일명).
-rsync -avz docker-compose.nas.yml "$NAS_SSH_HOST:$NAS_BASE/docker-compose.yml"
-rsync -avz --delete sql/          "$NAS_SSH_HOST:$NAS_BASE/sql/"
-rsync -avz "$ENV_NAS_SRC"         "$NAS_SSH_HOST:$NAS_BASE/.env"
+# rsync 대신 scp 사용 (Synology rsync --server 권한 문제 우회)
+scp docker-compose.nas.yml "$NAS_SSH_HOST:$NAS_BASE/docker-compose.yml"
+scp sql/*.sql               "$NAS_SSH_HOST:$NAS_BASE/sql/"
+scp "$ENV_NAS_SRC"          "$NAS_SSH_HOST:$NAS_BASE/.env"
 ssh "$NAS_SSH_HOST" "chmod 600 $NAS_BASE/.env"
 ok  "전송 완료"
 

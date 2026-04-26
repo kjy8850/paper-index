@@ -1,0 +1,19 @@
+{
+  "type": "OBJECT",
+  "properties": {
+    "summary_ko":      { "type": "STRING",  "description": "한글 3-4줄 요약" },
+    "key_findings":    { "type": "ARRAY",   "items": { "type": "STRING" }, "description": "핵심 발견/기여 리스트" },
+    "materials":       { "type": "ARRAY",   "items": { "type": "STRING" }, "description": "언급된 주요 소재/화합물" },
+    "techniques":      { "type": "ARRAY",   "items": { "type": "STRING" }, "description": "분석·공정·측정 기법" },
+    "major_category":  { "type": "STRING",  "description": "resin|pr|develop_etch|litho|metrology|misc_semi|novel_idea 중 하나" },
+    "mid_category":    { "type": "STRING",  "description": "중분류 (제시된 예시 중 우선 선택, 없으면 신규)" },
+    "sub_category":    { "type": "STRING",  "description": "소분류 (제시된 예시 중 우선 선택, 없으면 신규)" },
+    "tags":            { "type": "ARRAY",   "items": { "type": "STRING" }, "description": "자유 태그 3-6개" },
+    "novelty_score":   { "type": "INTEGER", "description": "신선도/독창성 0-10" },
+    "relevance_score": { "type": "INTEGER", "description": "반도체 소재 관련성 0-10" }
+  },
+  "required": [
+    "summary_ko", "key_findings", "major_category",
+    "mid_category", "novelty_score", "relevance_score"
+  ]
+}
