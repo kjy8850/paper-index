@@ -160,6 +160,7 @@ Makefile                       자주 쓰는 명령
 - `README.md` — 개괄
 - `PAPER_SYSTEM_ARCHITECTURE.md` — 5-Layer 파이프라인 사양
 - `docs/UPGRADE-V2.md` — v1→v2 마이그레이션 절차 (이 저장소를 처음 v2 로 올릴 때)
+- `docs/UPGRADE-V2-EXECUTE.md` — **미니PC 에서 v1→v2 업그레이드를 Claude Code 가 그대로 실행하는 지시서** (사용자는 이 파일을 가리키는 한 줄 프롬프트만 주면 됨)
 - `docs/DEPLOY-HYBRID.md` — 하이브리드 배포 상세
 - `docs/RUNBOOK.md` — 처음 30분 체크리스트
 - `docs/PDF-PIPELINE.md` — Docling + Gemini Batch + 일일 비용 가드
