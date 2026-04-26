@@ -10,12 +10,15 @@
     "start:ingest": "node src/ingest.js",
     "start:search": "node src/search.js",
     "start:mcp": "node src/mcp-server.js",
+    "start:deep-parser": "node src/deep-parser.js",
+    "start:pdf-worker": "node src/pdf-worker.js",
     "db:init": "node scripts/db-init.js",
     "db:reset": "node scripts/db-reset.js",
     "test:gemini": "node scripts/test-gemini.js",
     "test:search": "node scripts/test-search.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
     "@google/generative-ai": "^0.21.0",
     "@modelcontextprotocol/sdk": "^1.0.4",
     "dotenv": "^16.4.5",
