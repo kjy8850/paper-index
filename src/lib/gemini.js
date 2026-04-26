@@ -74,6 +74,9 @@ const paperAnalysisSchema = {
   ],
 };
 
+// taxonomy.json 의 major_categories[].id 와 동기화 (resin / pr / develop_etch /
+// litho / metrology / misc_semi / novel_idea). 변경 시 config/taxonomy.json 과
+// sql/migrations 모두 함께 점검할 것.
 const ALLOWED_MAJORS = new Set([
   'resin_synthesis', 'resist_formulation', 'litho_process', 'ancillary_metrology',
 ]);
@@ -145,13 +148,22 @@ export async function analyzePaper(paper, taxonomy) {
       },
     });
 
+    // taxonomy.json 의 example_mid_sub_categories 는 major id 별로 { mid, sub }
+    // 객체를 갖는 구조. 모델에 그대로 노출하면 토큰만 소모하므로 평탄화해서 힌트만 줌.
+    const midExamples = {};
+    const subExamples = {};
+    for (const [majorId, ex] of Object.entries(taxonomy.example_mid_sub_categories ?? {})) {
+      if (majorId === '_note') continue;
+      if (Array.isArray(ex?.mid)) midExamples[majorId] = ex.mid;
+      if (Array.isArray(ex?.sub)) subExamples[majorId] = ex.sub;
+    }
     const taxonomyHint = JSON.stringify(
       {
         major_categories: taxonomy.major_categories.map((m) => ({
           id: m.id, label_en: m.label_en, label_ko: m.label_ko,
         })),
-        mid_generation_examples: taxonomy.example_mid_sub_categories.generation_mid,
-        sub_goal_examples: taxonomy.example_mid_sub_categories.goal_sub,
+        mid_examples_by_major: midExamples,
+        sub_examples_by_major: subExamples,
       },
       null, 2,
     );
