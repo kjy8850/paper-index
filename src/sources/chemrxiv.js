@@ -1,11 +1,13 @@
 // =====================================================================
 // ChemRxiv 어댑터
 // 공식 REST API: https://chemrxiv.org/engage/chemrxiv/public-api/v1/items
-// 키워드 검색 + 페이지네이션.
+// 정책: 5 req/sec
 // =====================================================================
 
 import { request } from 'undici';
 import { logger } from '../lib/logger.js';
+import { withRateLimit } from '../lib/rate-limiter.js';
+import { finalizePaperRef } from '../lib/normalize.js';
 
 const BASE = 'https://chemrxiv.org/engage/chemrxiv/public-api/v1/items';
 
@@ -21,15 +23,23 @@ export async function searchChemRxiv({ query, max = 30, daysWindow, categoryHint
   const url   = `${BASE}?term=${encodeURIComponent(query)}&limit=${limit}&sort=PUBLISHED_DATE_DESC`;
 
   try {
-    const { statusCode, body } = await request(url, {
-      headers: { accept: 'application/json', 'user-agent': 'Mozilla/5.0 (compatible; paper-index/1.0)' },
-      headersTimeout: 15_000, bodyTimeout: 30_000,
+    // rate-limit (5 req/sec) 안에서 호출 + 일부 응답이 user-agent 없으면 차단되므로 명시.
+    const json = await withRateLimit('chemrxiv', async () => {
+      const { statusCode, body } = await request(url, {
+        headers: {
+          accept: 'application/json',
+          'user-agent': 'Mozilla/5.0 (compatible; paper-index/1.0)',
+        },
+        headersTimeout: 15_000, bodyTimeout: 30_000,
+      });
+      if (statusCode !== 200) {
+        logger.warn({ statusCode }, 'ChemRxiv: non-200');
+        return null;
+      }
+      return body.json();
     });
-    if (statusCode !== 200) {
-      logger.warn({ statusCode }, 'ChemRxiv: non-200');
-      return [];
-    }
-    const json = await body.json();
+    if (!json) return [];
+
     const items = json?.itemHits ?? json?.items ?? [];
     const now = Date.now();
     const results = items.map((h) => normalize(h, categoryHint)).filter(Boolean);
@@ -53,7 +63,7 @@ function normalize(hit, categoryHint) {
       : [];
     const doi     = item.doi ? String(item.doi).toLowerCase() : undefined;
     const pdf_url = item.asset?.original?.url ?? item.mainManuscript?.asset?.original?.url;
-    return {
+    const ref = {
       source: 'chemrxiv',
       source_id: String(item.id),
       doi,
@@ -67,6 +77,7 @@ function normalize(hit, categoryHint) {
       citations: 0,
       category_hint: categoryHint,
     };
+    return finalizePaperRef(ref);
   } catch (err) {
     logger.warn({ err }, 'ChemRxiv normalize 실패');
     return null;

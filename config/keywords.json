@@ -1,26 +1,31 @@
 {
-  "_comment": "수집 쿼리에 사용할 키워드 세트. weight 가 높을수록 상위에서 더 많이 수집. 각 소스 API 에 맞게 쿼리로 변환됨.",
-  "version": 1,
+  "_comment": "v2: 수집 쿼리 세트. PAPER_SYSTEM_ARCHITECTURE.md §5 의 8개 핵심 쿼리 + 보조 쿼리. weight 가 높을수록 Phase 1 루프에서 먼저 소진.",
+  "version": 2,
   "primary": [
-    { "q": "photoresist resin polymer", "weight": 10, "category_hint": "resin" },
-    { "q": "EUV photoresist",           "weight": 10, "category_hint": "pr" },
-    { "q": "chemically amplified resist","weight": 9,  "category_hint": "pr" },
-    { "q": "metal oxide photoresist",   "weight": 8,  "category_hint": "pr" },
-    { "q": "photoresist development TMAH","weight": 7, "category_hint": "develop_etch" },
-    { "q": "EUV lithography resist outgassing","weight": 7, "category_hint": "pr" },
-    { "q": "line edge roughness LER photoresist","weight": 6, "category_hint": "pr" },
-    { "q": "photo acid generator PAG",  "weight": 6, "category_hint": "pr" }
+    { "q": "photoresist resin EUV",                "weight": 10, "category_hint": "resin" },
+    { "q": "photoresist composition semiconductor", "weight": 10, "category_hint": "pr" },
+    { "q": "EUV lithography material",             "weight": 9,  "category_hint": "litho" },
+    { "q": "photoresist development process",      "weight": 9,  "category_hint": "develop_etch" },
+    { "q": "etching semiconductor pattern",        "weight": 8,  "category_hint": "develop_etch" },
+    { "q": "EUV photoresist sensitivity",          "weight": 8,  "category_hint": "pr" },
+    { "q": "polymer resin photoresist synthesis",  "weight": 8,  "category_hint": "resin" },
+    { "q": "PAG photoacid generator resist",       "weight": 7,  "category_hint": "pr" }
   ],
   "secondary": [
-    { "q": "dry etching selectivity semiconductor", "weight": 5, "category_hint": "develop_etch" },
-    { "q": "spin-on carbon hard mask",              "weight": 4, "category_hint": "misc_semi" },
-    { "q": "negative tone development",             "weight": 5, "category_hint": "develop_etch" },
-    { "q": "molecular glass resist",                "weight": 5, "category_hint": "resin" },
+    { "q": "chemically amplified resist",          "weight": 6, "category_hint": "pr" },
+    { "q": "metal oxide photoresist",              "weight": 6, "category_hint": "pr" },
+    { "q": "line edge roughness LER photoresist", "weight": 6, "category_hint": "pr" },
+    { "q": "photoresist development TMAH",         "weight": 5, "category_hint": "develop_etch" },
+    { "q": "EUV lithography resist outgassing",   "weight": 5, "category_hint": "pr" },
+    { "q": "negative tone development",            "weight": 5, "category_hint": "develop_etch" },
+    { "q": "molecular glass resist",               "weight": 5, "category_hint": "resin" },
+    { "q": "dry etching selectivity semiconductor","weight": 4, "category_hint": "develop_etch" },
     { "q": "directed self assembly DSA lithography","weight": 4, "category_hint": "litho" },
-    { "q": "nanoimprint lithography resist",        "weight": 3, "category_hint": "litho" }
+    { "q": "spin-on carbon hard mask",             "weight": 3, "category_hint": "misc_semi" },
+    { "q": "nanoimprint lithography resist",       "weight": 3, "category_hint": "litho" }
   ],
   "fresh_probe": {
-    "_comment": "'독창적/신선한 아이디어' 포착용. 짧은 일반 쿼리로 최근 7일 내 논문 샘플링.",
+    "_comment": "Phase 2 에서 짧은 일반 쿼리로 최근 N 일 신규만 샘플링. Phase 1 에서는 사용 안 함.",
     "queries": [
       "novel photoresist",
       "new lithography material",
@@ -28,5 +33,17 @@
     ],
     "max_results_per_query": 20,
     "days_window": 14
+  },
+  "phase1": {
+    "_comment": "Phase 1 (과거 논문 대량 수집) 전용 파라미터. ingest API 가 system_config 와 함께 사용.",
+    "daily_target":           300,
+    "max_loop_hours":         20,
+    "min_new_to_continue":    50,
+    "per_source_per_query":   50
+  },
+  "phase2": {
+    "_comment": "Phase 2 (신규 논문) 전용. 매일 1회.",
+    "lookback_days":          7,
+    "per_source_per_query":   30
   }
 }

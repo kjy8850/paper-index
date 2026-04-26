@@ -1,30 +1,33 @@
 // =====================================================================
 // arXiv API 어댑터
 // http://export.arxiv.org/api/query
-// 반환: 정규화된 PaperRef 객체 배열
+// 정책: 3 sec / req
 // =====================================================================
 
 import { request } from 'undici';
 import { parseStringPromise } from 'xml2js';
 import { logger } from '../lib/logger.js';
+import { withRateLimit } from '../lib/rate-limiter.js';
+import { finalizePaperRef } from '../lib/normalize.js';
 
 const BASE = 'https://export.arxiv.org/api/query';
 
 /**
  * @typedef {Object} PaperRef
- * @property {string} source       'arxiv' | 'semantic_scholar' | 'chemrxiv'
+ * @property {string} source             'arxiv' | 'semantic_scholar' | 'chemrxiv' | 'openalex'
  * @property {string} source_id
  * @property {string=} doi
  * @property {string=} arxiv_id
  * @property {string} title
+ * @property {string=} title_normalized   normalize.js 로 정규화된 제목 (dedupe 키)
  * @property {string=} abstract
  * @property {string[]} authors
- * @property {string=} published_at   'YYYY-MM-DD'
+ * @property {string=} published_at       'YYYY-MM-DD'
  * @property {string=} venue
  * @property {string=} url
  * @property {string=} pdf_url
  * @property {number=} citations
- * @property {string=} category_hint  우리 분류 시스템의 major id 힌트
+ * @property {string=} category_hint
  */
 
 /**
@@ -32,24 +35,29 @@ const BASE = 'https://export.arxiv.org/api/query';
  * @param {Object} opts
  * @param {string} opts.query
  * @param {number} [opts.max=50]
- * @param {number} [opts.daysWindow]   최근 N 일 내 필터
+ * @param {number} [opts.daysWindow]
  * @param {string} [opts.categoryHint]
  * @returns {Promise<PaperRef[]>}
  */
 export async function searchArxiv({ query, max = 50, daysWindow, categoryHint }) {
   // 단어별 AND 검색 (exact phrase는 결과가 너무 적음)
+  // arXiv API 는 `+AND+` 를 그대로 받으므로 encodeURIComponent 처리하지 않는다.
   const terms = query.replace(/"/g, '').trim().split(/\s+/);
   const q = terms.map(t => `all:${t}`).join('+AND+');
   const url = `${BASE}?search_query=${q}&start=0&max_results=${max}&sortBy=submittedDate&sortOrder=descending`;
 
   try {
-    const { statusCode, body } = await request(url, { headersTimeout: 15_000, bodyTimeout: 30_000 });
-    if (statusCode !== 200) {
-      logger.warn({ statusCode, url }, 'arXiv: non-200');
-      return [];
-    }
-    const xml    = await body.text();
-    const parsed = await parseStringPromise(xml, { explicitArray: false });
+    const xml = await withRateLimit('arxiv', async () => {
+      const { statusCode, body } = await request(url, { headersTimeout: 15_000, bodyTimeout: 30_000 });
+      if (statusCode !== 200) {
+        logger.warn({ statusCode, url }, 'arXiv: non-200');
+        return null;
+      }
+      return body.text();
+    });
+    if (!xml) return [];
+
+    const parsed  = await parseStringPromise(xml, { explicitArray: false });
     const entries = parsed?.feed?.entry;
     if (!entries) return [];
     const list = Array.isArray(entries) ? entries : [entries];
@@ -69,7 +77,6 @@ export async function searchArxiv({ query, max = 50, daysWindow, categoryHint })
 
 function normalize(entry, categoryHint) {
   try {
-    // entry.id: http://arxiv.org/abs/2401.01234v1
     const idUrl    = entry.id;
     const m        = /arxiv\.org\/abs\/([^\s]+?)(v\d+)?$/i.exec(idUrl ?? '');
     const arxivId  = m ? m[1] : null;
@@ -84,7 +91,7 @@ function normalize(entry, categoryHint) {
       .map((a) => (typeof a === 'string' ? a : a?.name))
       .filter(Boolean);
 
-    return {
+    const ref = {
       source: 'arxiv',
       source_id: arxivId,
       arxiv_id: arxivId,
@@ -99,6 +106,7 @@ function normalize(entry, categoryHint) {
       citations: 0,
       category_hint: categoryHint,
     };
+    return finalizePaperRef(ref);
   } catch (err) {
     logger.warn({ err }, 'arXiv normalize 실패');
     return null;

@@ -1,11 +1,18 @@
 // =====================================================================
-// Ingestion 엔진
-// - 단독 실행: node src/ingest.js (Express API)
-// - n8n 에서 호출할 엔드포인트:
-//     POST /ingest/batch     : PaperRef[] 받아 분석·저장
-//     POST /ingest/run-daily : 수집부터 저장까지 한 번에 수행
-//     GET  /health
-// - 모든 단계에 try/catch + ingestion_log 기록.
+// Ingestion 엔진 — Layer 1 (수집·중복제거·staging)
+//
+//  변경 (PAPER_SYSTEM_ARCHITECTURE.md 기준)
+//   - 더 이상 research_papers 에 직접 INSERT 하지 않는다.
+//   - 모든 신규 논문은 papers_staging 으로 들어가고, 분석·임베딩은
+//     Layer 2 (Gemini Flash batch) 와 Layer 4 (Claude Deep Parser) 가 담당한다.
+//   - 메모리 dedupe 후, papers_history + papers_excluded + papers_staging
+//     3 테이블에 대조해 한 번이라도 본 논문은 자동 차단한다.
+//
+//  엔드포인트 (n8n / 운영자 호출)
+//     POST /ingest/batch       : PaperRef[] 를 직접 받아 staging 에 넣음
+//     POST /ingest/run-phase   : Phase 1/2 분기를 서버 안에서 수행 (Task 2 에서 채워짐)
+//     POST /ingest/run-daily   : 호환용 (run-phase 를 호출)
+//     GET  /health, /dashboard, /api/status
 // =====================================================================
 
 import 'dotenv/config';
@@ -14,10 +21,15 @@ import { z } from 'zod';
 import pLimit from 'p-limit';
 
 import { logger, childLogger } from './lib/logger.js';
-import { query, toVectorLiteral, ping, close } from './lib/db.js';
-import { embedText } from './lib/embedding.js';
+import { query, ping, close } from './lib/db.js';
 import { loadKeywords } from './lib/config.js';
 import { searchAll, dedupeKey } from './sources/index.js';
+import { finalizePaperRef } from './lib/normalize.js';
+import { dedupeAgainstDb } from './lib/dedupe.js';
+import {
+  getPhase1State, setPhase1State, ensureTodayPhase1Window,
+  getConfig, setConfig,
+} from './lib/system-config.js';
 
 // =====================================================================
 // 대시보드 HTML
@@ -195,259 +207,438 @@ setInterval(load, 30000);
 </html>`;
 
 // =====================================================================
-// 공통 유틸
+// PaperRef 스키마 — 4 개 소스 + manual 입력 허용
 // =====================================================================
 const PaperRefSchema = z.object({
-  source:       z.enum(['arxiv', 'semantic_scholar', 'chemrxiv', 'manual']),
-  source_id:    z.string().min(1),
-  doi:          z.string().optional(),
-  arxiv_id:     z.string().optional(),
-  title:        z.string().min(1),
-  abstract:     z.string().optional().default(''),
-  authors:      z.array(z.string()).optional().default([]),
-  published_at: z.string().optional(),
-  venue:        z.string().optional(),
-  url:          z.string().optional(),
-  pdf_url:      z.string().optional(),
-  citations:    z.number().optional().default(0),
-  category_hint:z.string().optional(),
-  fullText:     z.string().optional(),   // 선택: 본문 텍스트
+  source:           z.enum(['arxiv', 'semantic_scholar', 'chemrxiv', 'openalex', 'manual']),
+  source_id:        z.string().min(1),
+  doi:              z.string().optional(),
+  arxiv_id:         z.string().optional(),
+  title:            z.string().min(1),
+  title_normalized: z.string().optional(),
+  abstract:         z.string().optional().default(''),
+  authors:          z.array(z.string()).optional().default([]),
+  published_at:     z.string().optional(),
+  year:             z.number().int().optional(),
+  venue:            z.string().optional(),
+  url:              z.string().optional(),
+  pdf_url:          z.string().optional(),
+  citations:        z.number().optional().default(0),
+  category_hint:    z.string().optional(),
 });
 
-async function upsertPaper(ref, analysis, embedding) {
-  const vec = toVectorLiteral(embedding);
+// =====================================================================
+// papers_staging INSERT
+//   - 분석/임베딩은 하지 않는다 (Layer 2/4 가 처리).
+//   - PDF URL 유무에 따라 fulltext_status 만 결정.
+//   - 같은 batch 내에서도 중복 INSERT 가 발생할 수 있어 ON CONFLICT 가드.
+// =====================================================================
+async function insertStaging(ref) {
+  const status = /^https?:\/\/.+/.test(ref.pdf_url ?? '') ? 'pending' : 'no_pdf';
+  const year = Number.isFinite(ref.year)
+    ? ref.year
+    : (ref.published_at ? Number(ref.published_at.slice(0, 4)) : null);
+
+  const sql = `
+    INSERT INTO papers_staging (
+      doi, arxiv_id, source, source_id,
+      title, title_normalized, authors, year, abstract,
+      url, pdf_url, venue, citations, category_hint,
+      fulltext_status, raw_metadata
+    ) VALUES (
+      $1,$2,$3,$4,
+      $5,$6,$7::jsonb,$8,$9,
+      $10,$11,$12,$13,$14,
+      $15,$16::jsonb
+    )
+    RETURNING id
+  `;
   const params = [
     ref.doi ?? null,
     ref.arxiv_id ?? null,
     ref.source,
     ref.source_id,
+    ref.title,
+    ref.title_normalized ?? null,
+    JSON.stringify(ref.authors ?? []),
+    Number.isFinite(year) ? year : null,
+    ref.abstract ?? null,
     ref.url ?? null,
     ref.pdf_url ?? null,
-    ref.title,
-    ref.abstract ?? null,
-    JSON.stringify(ref.authors ?? []),
-    ref.published_at ?? null,
     ref.venue ?? null,
     ref.citations ?? 0,
-    analysis.summary_ko ?? null,
-    JSON.stringify(analysis.key_findings ?? []),
-    JSON.stringify(analysis.materials ?? []),
-    JSON.stringify(analysis.techniques ?? []),
-    analysis.novelty_score ?? null,
-    analysis.relevance_score ?? null,
-    analysis.major_category,
-    analysis.mid_category ?? null,
-    analysis.sub_category ?? null,
-    JSON.stringify(analysis.tags ?? []),
-    vec,
+    ref.category_hint ?? null,
+    status,
     JSON.stringify({ source_raw: ref.source }),
-    /^https?:\/\/.+/.test(ref.pdf_url ?? '') ? 'pending' : 'no_pdf',
   ];
-  // DOI 기준 우선 충돌, 없으면 arxiv_id, 없으면 source+source_id 로.
-  const sql = `
-    INSERT INTO research_papers
-      (doi, arxiv_id, source, source_id, url, pdf_url, title, abstract,
-       authors, published_at, venue, citations,
-       summary_ko, key_findings, materials, techniques,
-       novelty_score, relevance_score,
-       major_category, mid_category, sub_category, tags,
-       embedding, raw_metadata, fulltext_status)
-    VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::vector,$24::jsonb,$25)
-    ON CONFLICT (doi) DO UPDATE SET
-      title           = EXCLUDED.title,
-      abstract        = EXCLUDED.abstract,
-      authors         = EXCLUDED.authors,
-      venue           = EXCLUDED.venue,
-      citations       = EXCLUDED.citations,
-      -- 분석 필드: 이미 채워진 값은 보존 (batch 결과가 ingest 재수집으로 지워지는 것 방지)
-      summary_ko      = COALESCE(research_papers.summary_ko,      EXCLUDED.summary_ko),
-      key_findings    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.key_findings    ELSE EXCLUDED.key_findings    END,
-      materials       = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.materials       ELSE EXCLUDED.materials       END,
-      techniques      = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.techniques      ELSE EXCLUDED.techniques      END,
-      novelty_score   = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.novelty_score   ELSE EXCLUDED.novelty_score   END,
-      relevance_score = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.relevance_score ELSE EXCLUDED.relevance_score END,
-      major_category  = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.major_category  ELSE EXCLUDED.major_category  END,
-      mid_category    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.mid_category    ELSE EXCLUDED.mid_category    END,
-      sub_category    = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.sub_category    ELSE EXCLUDED.sub_category    END,
-      tags            = CASE WHEN research_papers.summary_ko IS NOT NULL THEN research_papers.tags            ELSE EXCLUDED.tags            END,
-      embedding       = EXCLUDED.embedding,
-      updated_at      = now()
-    RETURNING id;
-  `;
   const { rows } = await query(sql, params);
-  return rows[0]?.id;
-}
-
-async function updateCategoryMaster(analysis) {
-  const sql = `
-    INSERT INTO categories (major_id, mid_label, sub_label, usage_count, last_seen_at)
-    VALUES ($1, $2, $3, 1, now())
-    ON CONFLICT (major_id, mid_label, sub_label)
-    DO UPDATE SET usage_count = categories.usage_count + 1, last_seen_at = now();
-  `;
-  await query(sql, [
-    analysis.major_category,
-    analysis.mid_category ?? null,
-    analysis.sub_category ?? null,
-  ]);
-}
-
-// 분석 없이 저장할 때 쓰는 빈 분석 객체 (Batch API가 나중에 채움)
-const EMPTY_ANALYSIS = {
-  summary_ko: null,
-  key_findings: [],
-  materials: [],
-  techniques: [],
-  novelty_score: 0,
-  relevance_score: 0,
-  major_category: 'misc_semi',
-  mid_category: null,
-  sub_category: null,
-  tags: [],
-};
-
-/**
- * DB에 이미 존재하는지 식별자(DOI, Arxiv ID, Source+ID)로 체크.
- */
-async function checkExists(ref) {
-  const conditions = [];
-  const params = [];
-
-  if (ref.doi) {
-    params.push(ref.doi);
-    conditions.push(`doi = $${params.length}`);
-  }
-  if (ref.arxiv_id) {
-    params.push(ref.arxiv_id);
-    conditions.push(`arxiv_id = $${params.length}`);
-  }
-  // Source + ID 조합도 체크
-  params.push(ref.source, ref.source_id);
-  conditions.push(`(source = $${params.length - 1} AND source_id = $${params.length})`);
-
-  const sql = `SELECT id FROM research_papers WHERE ${conditions.join(' OR ')} LIMIT 1`;
-  const { rows } = await query(sql, params);
-  return rows[0]?.id || null;
+  return { id: rows[0]?.id, status };
 }
 
 /**
- * 단일 논문 처리: 중복 체크 -> 임베딩(title+abstract) → upsert. 분석은 Batch API에서 비동기 수행.
+ * 한 묶음 (PaperRef[]) 을 papers_staging 에 적재.
+ *  1. zod 검증 + finalizePaperRef (혹시 누락된 정규화 필드 보정)
+ *  2. 메모리 내부 dedupe (sources/index.js 의 dedupe 와 동일 키 정책)
+ *  3. dedupeAgainstDb 로 papers_history / excluded / staging 3 테이블 조회
+ *  4. 살아남은 ref 만 INSERT
+ *
+ *  반환:
+ *    { staged, duplicated_db, duplicated_inflight, invalid, samples }
  */
-async function ingestOne(ref, _taxonomy, log) {
-  try {
-    // 1) DB 존재 여부 먼저 체크 (토큰 아끼기)
-    const existingId = await checkExists(ref);
-    if (existingId) {
-      log.info({ id: existingId, title: ref.title.slice(0, 60) }, 'already exists, skipping embedding');
-      return { ok: true, id: existingId, skipped: true };
-    }
-
-    // 2) 존재하지 않을 때만 임베딩 API 호출
-    const textToEmbed = [ref.title, ref.abstract ?? ''].filter(Boolean).join('\n');
-    const embedding = await embedText(textToEmbed, 'RETRIEVAL_DOCUMENT');
-    const id = await upsertPaper(ref, EMPTY_ANALYSIS, embedding);
-    log.info({ id, title: ref.title.slice(0, 60) }, 'ingested (analysis queued for batch)');
-    return { ok: true, id };
-  } catch (err) {
-    log.error({ err: err?.message, title: ref.title?.slice(0, 60) }, 'ingest 실패');
-    return { ok: false, error: err?.message };
-  }
-}
-
-// =====================================================================
-// /ingest/batch : PaperRef 배열 받아 처리
-// =====================================================================
-async function handleBatch(paperRefs) {
-  const log = childLogger({ mod: 'batch' });
-
-  const limit = pLimit(Number(process.env.GEMINI_CONCURRENCY ?? 3));
+export async function stageRefs(paperRefs, { phase = 'phase2', logChild } = {}) {
+  const log = logChild ?? childLogger({ mod: 'stage' });
+  const limitDb = pLimit(Number(process.env.STAGING_INSERT_CONCURRENCY ?? 8));
   const errorSamples = [];
 
-  let ingested = 0;
-  let failed   = 0;
-  const results = await Promise.all(paperRefs.map((r) =>
-    limit(async () => {
-      const parsed = PaperRefSchema.safeParse(r);
-      if (!parsed.success) {
-        failed += 1;
-        errorSamples.push({ title: r?.title, error: parsed.error.errors[0]?.message });
-        return { ok: false, error: 'validation' };
+  // 1) 검증 + 정규화
+  const validated = [];
+  let invalid = 0;
+  for (const r of paperRefs) {
+    const parsed = PaperRefSchema.safeParse(r);
+    if (!parsed.success) {
+      invalid += 1;
+      if (errorSamples.length < 5) {
+        errorSamples.push({ title: r?.title, error: parsed.error.errors[0]?.message ?? 'validation' });
       }
-      const res = await ingestOne(parsed.data, null, log);
-      if (res.ok) ingested += 1;
-      else { failed += 1; if (errorSamples.length < 5) errorSamples.push({ title: r.title, error: res.error }); }
-      return res;
-    })
-  ));
+      continue;
+    }
+    const fin = finalizePaperRef(parsed.data) ?? parsed.data;
+    validated.push(fin);
+  }
 
-  return { ingested, failed, total: paperRefs.length, errorSamples, results };
+  // 2) 메모리 내 dedupe (한 batch 안에서 중복 들어오는 경우)
+  const seenKeys = new Set();
+  const memUnique = [];
+  let duplicatedInflight = 0;
+  for (const r of validated) {
+    const key = dedupeKey(r);
+    if (seenKeys.has(key)) {
+      duplicatedInflight += 1;
+      continue;
+    }
+    seenKeys.add(key);
+    memUnique.push(r);
+  }
+
+  // 3) DB 3-테이블 dedup
+  const { kept, excluded } = await dedupeAgainstDb(memUnique);
+  const duplicatedDb = excluded.length;
+
+  // 4) staging INSERT (병렬 약간 제한)
+  let staged = 0;
+  let stageFail = 0;
+  const insertResults = await Promise.all(kept.map((r) => limitDb(async () => {
+    try {
+      const res = await insertStaging(r);
+      staged += 1;
+      return { ok: true, id: res.id, status: res.status };
+    } catch (err) {
+      stageFail += 1;
+      if (errorSamples.length < 5) {
+        errorSamples.push({ title: r.title?.slice(0, 60), error: err?.message });
+      }
+      return { ok: false, error: err?.message };
+    }
+  })));
+
+  log.info({
+    phase, total: paperRefs.length, validated: validated.length,
+    duplicated_inflight: duplicatedInflight,
+    duplicated_db: duplicatedDb,
+    staged, stage_failed: stageFail, invalid,
+  }, 'stageRefs 완료');
+
+  return {
+    phase,
+    total: paperRefs.length,
+    validated: validated.length,
+    duplicated_inflight: duplicatedInflight,
+    duplicated_db: duplicatedDb,
+    staged,
+    stage_failed: stageFail,
+    invalid,
+    error_samples: errorSamples,
+    results: insertResults,
+  };
+}
+
+// 호환성을 위해 옛 이름도 노출
+export const handleBatch = stageRefs;
+
+// =====================================================================
+// 키워드 기반 다중 소스 수집 → stageRefs
+//
+// 이 함수는 Phase 1/2 분기 로직(Task 2)에서 호출되는 빌딩 블록.
+// 단순 한 패스 수집/적재만 한다 (커서·종료조건은 호출자가 관리).
+// =====================================================================
+export async function collectAndStage({
+  queries,
+  perSource = Number(process.env.MAX_PER_SOURCE ?? 50),
+  sources,
+  daysWindow,
+  phase = 'phase2',
+} = {}) {
+  const log = childLogger({ mod: 'collect' });
+  const keywords = await loadKeywords();
+
+  // queries 가 비어있으면 keywords.json 의 primary+secondary 를 weight 순으로
+  const planned = (queries && queries.length)
+    ? queries
+    : [...(keywords.primary ?? []), ...(keywords.secondary ?? [])]
+        .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+
+  // 1) 수집 (메모리 dedupe 까지는 sources/index.js 가 처리)
+  const collectedMap = new Map();
+  for (const k of planned) {
+    const q = typeof k === 'string' ? k : k.q;
+    const cat = typeof k === 'string' ? undefined : k.category_hint;
+    if (!q) continue;
+
+    let refs = [];
+    try {
+      refs = await searchAll({ query: q, perSource, sources, daysWindow, categoryHint: cat });
+    } catch (err) {
+      log.warn({ q, err: err.message }, 'searchAll 실패');
+    }
+    for (const r of refs) {
+      const key = dedupeKey(r);
+      if (!collectedMap.has(key)) collectedMap.set(key, r);
+    }
+    log.info({ q, gotNow: refs.length, totalUniq: collectedMap.size }, '수집 진행');
+  }
+
+  const refs = Array.from(collectedMap.values());
+
+  // 2) ingestion_log 행 + stageRefs
+  const { rows: [logRow] } = await query(
+    `INSERT INTO ingestion_log (source, query, requested, fetched, deduped, phase)
+     VALUES ('combined', $1, $2, $3, $4, $5)
+     RETURNING id, run_id`,
+    ['collectAndStage', refs.length, refs.length, refs.length, phase],
+  );
+
+  const stage = await stageRefs(refs, { phase, logChild: log });
+
+  await query(
+    `UPDATE ingestion_log
+        SET ingested = $1,
+            staged   = $1,
+            failed   = $2,
+            excluded_dedup = $3,
+            error_samples  = $4::jsonb,
+            finished_at    = now()
+      WHERE id = $5`,
+    [stage.staged, stage.stage_failed + stage.invalid, stage.duplicated_db,
+     JSON.stringify(stage.error_samples), logRow.id],
+  );
+
+  return { run_id: logRow.run_id, fetched: refs.length, ...stage };
 }
 
 // =====================================================================
-// /ingest/run-daily : 수집 + 처리까지
+// Phase 1 / Phase 2 분기 (PAPER_SYSTEM_ARCHITECTURE.md §5)
+//
+//  - Phase 1 : system_config.phase1_completed = false 인 동안. 키워드를 회전
+//              하며 cursor 를 전진시켜 과거 논문 대량 수집.
+//              한 호출당 처리량은 maxBudgetMs / maxIterations 로 묶는다
+//              (HTTP 응답 시간 폭주 방지).
+//              종료 조건은 동일 호출 안에서뿐 아니라 system_config 에 누적되어
+//              n8n 이 같은 엔드포인트를 다시 호출해도 자연스럽게 이어진다.
+//  - Phase 2 : 일 1회. 최근 윈도우(daysWindow) 내 신규만 수집.
 // =====================================================================
-async function runDaily() {
-  const log = childLogger({ mod: 'run-daily' });
+
+const PHASE1_DAILY_TARGET   = Number(process.env.PHASE1_DAILY_TARGET   ?? 300);
+const PHASE1_TIMEOUT_HOURS  = Number(process.env.PHASE1_TIMEOUT_HOURS  ?? 20);
+const PHASE1_MIN_BATCH      = Number(process.env.PHASE1_MIN_BATCH      ?? 50);
+const PHASE1_PER_KEYWORD    = Number(process.env.PHASE1_PER_KEYWORD    ?? 50);
+const PHASE2_DAYS_WINDOW    = Number(process.env.PHASE2_DAYS_WINDOW    ?? 14);
+
+/**
+ * 한 키워드(질의어) 에 대해 4 소스를 한 번 훑어서 staging 까지 진행.
+ * Phase 1 루프가 반복 호출하는 단위.
+ */
+async function sweepOneKeyword({ keyword, perSource, sources, daysWindow, phase, log }) {
+  const q = typeof keyword === 'string' ? keyword : keyword.q;
+  const cat = typeof keyword === 'string' ? undefined : keyword.category_hint;
+  if (!q) return { staged: 0, fetched: 0, duplicated_db: 0, duplicated_inflight: 0 };
+
+  let refs = [];
+  try {
+    refs = await searchAll({ query: q, perSource, sources, daysWindow, categoryHint: cat });
+  } catch (err) {
+    log.warn({ q, err: err.message }, 'searchAll 실패');
+    return { staged: 0, fetched: 0, duplicated_db: 0, duplicated_inflight: 0, error: err.message };
+  }
+
+  const stage = await stageRefs(refs, { phase, logChild: log });
+  return { fetched: refs.length, ...stage, query: q };
+}
+
+/**
+ * Phase 1 단일 호출분. n8n 이 매일 새벽 호출하면 충분하지만, 같은 날
+ * 다시 호출돼도 안전 (cursor + collectedToday 를 system_config 에 보존).
+ *
+ *  옵션:
+ *   - maxBudgetMs       : 이번 호출의 처리 시간 상한 (default 60s)
+ *   - maxIterations     : 이번 호출의 키워드 sweep 횟수 상한 (default 12)
+ *   - perSource         : 키워드당 / 소스당 가져올 건수 (default PHASE1_PER_KEYWORD)
+ *   - sources           : ['openalex', 'semantic_scholar', 'arxiv', 'chemrxiv']
+ */
+export async function runPhase1Once({
+  maxBudgetMs   = Number(process.env.PHASE1_CALL_BUDGET_MS ?? 60_000),
+  maxIterations = Number(process.env.PHASE1_CALL_MAX_ITER  ?? 12),
+  perSource     = PHASE1_PER_KEYWORD,
+  sources,
+} = {}) {
+  const log = childLogger({ mod: 'phase1' });
+  const startedAt = Date.now();
+
+  await ensureTodayPhase1Window();
+  const stateBefore = await getPhase1State();
+  if (stateBefore.completed) {
+    log.info('phase1 이미 완료. phase2 로 위임.');
+    return { phase: 'phase2', delegated: true, ...(await runPhase2Once()) };
+  }
+
   const keywords = await loadKeywords();
-
-  const target = Number(process.env.DAILY_TARGET ?? 300);
-  const perSource = Number(process.env.MAX_PER_SOURCE ?? 50);
-
-  // 1) 수집
-  const collected = new Map(); // dedupeKey -> ref
-  const queries = [...keywords.primary, ...keywords.secondary]
-    .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
-
-  for (const k of queries) {
-    if (collected.size >= target * 1.5) break; // 충분히 모으면 중단
-    const refs = await searchAll({ query: k.q, perSource, categoryHint: k.category_hint });
-    for (const r of refs) {
-      const key = dedupeKey(r);
-      if (!collected.has(key)) collected.set(key, r);
-      if (collected.size >= target * 1.5) break;
-    }
-    log.info({ query: k.q, gotNow: refs.length, totalUniq: collected.size }, '수집 중');
+  const planned = [
+    ...(keywords.primary   ?? []),
+    ...(keywords.secondary ?? []),
+  ].sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
+  if (!planned.length) {
+    log.warn('keywords.json 비어있음 → Phase 1 종료 처리');
+    await setPhase1State({ completed: true });
+    return { phase: 'phase1', completed: true, reason: 'no_keywords' };
   }
 
-  // fresh_probe
-  const fresh = keywords.fresh_probe;
-  if (fresh?.queries?.length) {
-    for (const q of fresh.queries) {
-      if (collected.size >= target * 2) break;
-      const refs = await searchAll({
-        query: q, perSource: fresh.max_results_per_query ?? 20,
-        daysWindow: fresh.days_window ?? 14,
-      });
-      for (const r of refs) {
-        const key = dedupeKey(r);
-        if (!collected.has(key)) collected.set(key, r);
-      }
-    }
-  }
+  // cursor.kwIdx 가 다음 sweep 할 키워드 인덱스
+  let cursor = stateBefore.cursor && typeof stateBefore.cursor === 'object'
+    ? { ...stateBefore.cursor }
+    : {};
+  if (typeof cursor.kwIdx !== 'number') cursor.kwIdx = 0;
 
-  // 2) target 개로 컷
-  const refs = Array.from(collected.values()).slice(0, target);
-  log.info({ count: refs.length }, '수집 완료 -> 분석 시작');
+  let collectedToday = stateBefore.collectedToday;
+  let totalCollected = stateBefore.totalCollected;
+  let stagedThisCall = 0;
+  let lastSweepStaged = 0;
+  const sweeps = [];
 
-  // 3) ingestion_log 시작 행
+  // ingestion_log
   const { rows: [logRow] } = await query(
-    `INSERT INTO ingestion_log (source, query, requested, fetched, deduped)
-     VALUES ('combined', 'run_daily', $1, $2, $3) RETURNING id, run_id`,
-    [target, refs.length, refs.length],
+    `INSERT INTO ingestion_log (source, query, requested, fetched, deduped, phase)
+     VALUES ('combined', 'phase1_loop', 0, 0, 0, 'phase1')
+     RETURNING id, run_id`,
   );
 
-  // 4) 배치 처리
-  const batchRes = await handleBatch(refs);
+  let i = 0;
+  let terminator = null;
+  while (i < maxIterations) {
+    if (Date.now() - startedAt > maxBudgetMs) { terminator = 'budget'; break; }
+    if (collectedToday >= PHASE1_DAILY_TARGET) { terminator = 'daily_target'; break; }
+
+    const kwIdx = cursor.kwIdx % planned.length;
+    const kw    = planned[kwIdx];
+    cursor.kwIdx = (cursor.kwIdx + 1) % planned.length;
+
+    const result = await sweepOneKeyword({
+      keyword: kw, perSource, sources, phase: 'phase1', log,
+    });
+    sweeps.push({ kw: typeof kw === 'string' ? kw : kw.q, ...result });
+    lastSweepStaged = result.staged ?? 0;
+    collectedToday += lastSweepStaged;
+    totalCollected += lastSweepStaged;
+    stagedThisCall += lastSweepStaged;
+    i += 1;
+  }
+
+  // 20시간 + 50건 미만 → Phase 1 완료 처리.
+  // 호출 안에서가 아니라 누적 startTime 기준으로 평가하므로
+  // n8n 이 같은 엔드포인트를 다음 날 다시 호출해도 자연스럽게 이어진다.
+  const startTimeIso = stateBefore.startTime || new Date(startedAt).toISOString();
+  const elapsedMs = Date.now() - new Date(startTimeIso).getTime();
+  const elapsedHours = elapsedMs / 3_600_000;
+  let completed = false;
+  if (collectedToday >= PHASE1_DAILY_TARGET) {
+    terminator = terminator ?? 'daily_target';
+  } else if (elapsedHours >= PHASE1_TIMEOUT_HOURS) {
+    if (lastSweepStaged < PHASE1_MIN_BATCH) {
+      completed = true;
+      terminator = 'phase1_done';
+    } else {
+      terminator = terminator ?? 'timeout_keep_going';
+    }
+  } else if (!terminator) {
+    terminator = 'iter_limit';
+  }
+
+  await setPhase1State({
+    completed,
+    cursor,
+    collectedToday,
+    totalCollected,
+  });
 
   await query(
-    `UPDATE ingestion_log SET ingested=$1, failed=$2, error_samples=$3::jsonb, finished_at=now()
-     WHERE id=$4`,
-    [batchRes.ingested, batchRes.failed, JSON.stringify(batchRes.errorSamples), logRow.id],
+    `UPDATE ingestion_log
+        SET ingested = $1, staged = $1, fetched = $2,
+            error_samples = $3::jsonb,
+            finished_at = now()
+      WHERE id = $4`,
+    [
+      stagedThisCall,
+      sweeps.reduce((a, s) => a + (s.fetched || 0), 0),
+      JSON.stringify(sweeps.slice(-5).map((s) => ({ q: s.kw, staged: s.staged, error: s.error }))),
+      logRow.id,
+    ],
   );
 
-  log.info({ ingested: batchRes.ingested, failed: batchRes.failed }, 'run-daily 완료');
-  return { run_id: logRow.run_id, ...batchRes };
+  log.info({
+    iterations: i,
+    elapsed_hours: Number(elapsedHours.toFixed(2)),
+    collectedToday, stagedThisCall, lastSweepStaged,
+    terminator, completed,
+  }, 'phase1 호출 종료');
+
+  return {
+    phase: 'phase1',
+    iterations: i,
+    sweeps_summary: sweeps.map((s) => ({ q: s.kw, staged: s.staged, fetched: s.fetched })),
+    staged_this_call: stagedThisCall,
+    collected_today: collectedToday,
+    total_collected: totalCollected,
+    last_sweep_staged: lastSweepStaged,
+    elapsed_hours: Number(elapsedHours.toFixed(2)),
+    terminator,
+    completed,
+    cursor,
+  };
+}
+
+/**
+ * Phase 2 단일 호출분. 최근 N 일 신규 논문만 수집.
+ */
+export async function runPhase2Once({
+  daysWindow = PHASE2_DAYS_WINDOW,
+  perSource  = Number(process.env.MAX_PER_SOURCE ?? 50),
+  sources,
+} = {}) {
+  return collectAndStage({ phase: 'phase2', daysWindow, perSource, sources });
+}
+
+/**
+ * 운영 진입점. system_config.phase1_completed 를 보고 자동 분기.
+ */
+export async function runIngestPhase(opts = {}) {
+  const completed = String(await getConfig('phase1_completed', 'false')).toLowerCase() === 'true';
+  if (completed) {
+    return { phase: 'phase2', ...(await runPhase2Once(opts)) };
+  }
+  return await runPhase1Once(opts);
+}
+
+// 옛 이름 호환 (n8n 등 외부 호출자)
+export async function runDaily() {
+  return runIngestPhase();
 }
 
 // =====================================================================
@@ -477,24 +668,52 @@ export function buildApp() {
 
   app.get('/api/status', async (_req, res) => {
     try {
-      const [papers, batches, cost] = await Promise.all([
-        query(`SELECT fulltext_status, COUNT(*)::int AS cnt
-               FROM research_papers GROUP BY 1 ORDER BY 2 DESC`),
-        query(`SELECT id, job_name, state, request_count, success_count, fail_count,
-                      error_samples, submitted_at, completed_at, applied_at
-               FROM batch_jobs ORDER BY id DESC LIMIT 10`),
-        query(`SELECT spent_usd, input_tokens, output_tokens, calls FROM v_today_cost`),
-      ]);
-      const failedPapers = await query(
-        `SELECT id, title, fulltext_error, fulltext_attempts
-         FROM research_papers WHERE fulltext_status='failed'
-         ORDER BY id DESC LIMIT 5`
+      const papersQ = query(
+        `SELECT fulltext_status, COUNT(*)::int AS cnt
+           FROM papers_staging GROUP BY 1
+        UNION ALL
+         SELECT fulltext_status, COUNT(*)::int AS cnt
+           FROM papers_history GROUP BY 1`,
       );
+      const batchesQ = query(
+        `SELECT id, job_name, state, request_count, success_count, fail_count,
+                error_samples, submitted_at, completed_at, applied_at
+           FROM batch_jobs ORDER BY id DESC LIMIT 10`,
+      ).catch(() => ({ rows: [] }));
+      const costQ = query(
+        `SELECT day, total_usd AS spent_usd FROM v_daily_cost ORDER BY day DESC LIMIT 1`,
+      ).catch(() => ({ rows: [] }));
+      const failedQ = query(
+        `SELECT id, title, fulltext_error
+           FROM papers_staging
+          WHERE fulltext_status IN ('failed', 'broken')
+          ORDER BY id DESC LIMIT 5`,
+      );
+      const phaseStateQ = query(
+        `SELECT key, value FROM system_config
+          WHERE key IN ('phase1_completed','phase1_collected_today','phase1_total_collected','phase1_start_time')`,
+      ).catch(() => ({ rows: [] }));
+
+      const [papers, batches, cost, failedPapers, phaseRows] = await Promise.all([
+        papersQ, batchesQ, costQ, failedQ, phaseStateQ,
+      ]);
+
+      const merged = new Map();
+      for (const r of papers.rows) {
+        merged.set(r.fulltext_status, (merged.get(r.fulltext_status) ?? 0) + Number(r.cnt));
+      }
+      const papersAgg = Array.from(merged.entries())
+        .map(([fulltext_status, cnt]) => ({ fulltext_status, cnt }))
+        .sort((a, b) => b.cnt - a.cnt);
+
+      const phaseState = Object.fromEntries((phaseRows.rows ?? []).map((r) => [r.key, r.value]));
+
       res.json({
-        papers: papers.rows,
+        papers: papersAgg,
         batches: batches.rows,
-        cost: cost.rows[0],
+        cost: cost.rows[0] ?? { spent_usd: 0 },
         failedPapers: failedPapers.rows,
+        phaseState,
         ts: new Date().toISOString(),
       });
     } catch (err) {
@@ -511,7 +730,7 @@ export function buildApp() {
     try {
       const refs = Array.isArray(req.body?.papers) ? req.body.papers : [];
       if (!refs.length) return res.status(400).json({ error: 'papers array required' });
-      const result = await handleBatch(refs);
+      const result = await stageRefs(refs, { phase: req.body?.phase ?? 'phase2' });
       res.json(result);
     } catch (err) {
       logger.error({ err }, '/ingest/batch 실패');
@@ -519,12 +738,43 @@ export function buildApp() {
     }
   });
 
+  app.post('/ingest/run-phase', async (req, res) => {
+    try {
+      const opts = {};
+      if (Number.isFinite(req.body?.maxBudgetMs))   opts.maxBudgetMs   = Number(req.body.maxBudgetMs);
+      if (Number.isFinite(req.body?.maxIterations)) opts.maxIterations = Number(req.body.maxIterations);
+      if (Number.isFinite(req.body?.perSource))     opts.perSource     = Number(req.body.perSource);
+      if (Array.isArray(req.body?.sources))         opts.sources       = req.body.sources;
+      if (Number.isFinite(req.body?.daysWindow))    opts.daysWindow    = Number(req.body.daysWindow);
+
+      let result;
+      if (req.body?.phase === 'phase1')      result = await runPhase1Once(opts);
+      else if (req.body?.phase === 'phase2') result = await runPhase2Once(opts);
+      else                                   result = await runIngestPhase(opts);
+      res.json(result);
+    } catch (err) {
+      logger.error({ err }, '/ingest/run-phase 실패');
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 호환: 기존 n8n 워크플로가 /run-daily 로 호출하는 경우 → 자동 분기
   app.post('/ingest/run-daily', async (_req, res) => {
     try {
-      const result = await runDaily();
+      const result = await runIngestPhase();
       res.json(result);
     } catch (err) {
       logger.error({ err }, '/ingest/run-daily 실패');
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 운영자가 phase1 을 강제로 닫고 싶을 때 (50 건 임계 튜닝 중)
+  app.post('/ingest/phase1/complete', async (_req, res) => {
+    try {
+      await setConfig('phase1_completed', 'true');
+      res.json({ ok: true, phase1_completed: true });
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
@@ -550,5 +800,3 @@ if (isMain) {
   process.on('SIGINT',  () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
-
-export { handleBatch, runDaily };
